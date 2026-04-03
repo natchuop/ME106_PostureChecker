@@ -686,8 +686,6 @@ def _draw_dense_px(frame, pa, pb, steps=6, color=(120, 220, 200), r=2):
 # Upper body only: no legs. Head/neck: nose + ears drawn separately.
 TORSO_CONNECTIONS = (
     (plm.LEFT_SHOULDER, plm.RIGHT_SHOULDER),
-    (plm.LEFT_SHOULDER, plm.LEFT_ELBOW),
-    (plm.RIGHT_SHOULDER, plm.RIGHT_ELBOW),
     (plm.LEFT_SHOULDER, plm.LEFT_HIP),
     (plm.RIGHT_SHOULDER, plm.RIGHT_HIP),
     (plm.LEFT_HIP, plm.RIGHT_HIP),
@@ -695,8 +693,6 @@ TORSO_CONNECTIONS = (
 TORSO_JOINT_INDICES = (
     plm.LEFT_SHOULDER,
     plm.RIGHT_SHOULDER,
-    plm.LEFT_ELBOW,
-    plm.RIGHT_ELBOW,
     plm.LEFT_HIP,
     plm.RIGHT_HIP,
 )
@@ -843,6 +839,8 @@ person_lost_streak = 0
 slouch_on_streak = 0
 slouch_off_streak = 0
 stable_slouching = False
+bad_since = None
+last_reasons = set()
 
 try:
     while True:
@@ -868,27 +866,30 @@ try:
                 lm = results.pose_landmarks
                 cached_landmarks = lm
 
-                raw_slouch = bad_posture(lm)
-                if raw_slouch:
-                    slouch_off_streak = 0
-                    slouch_on_streak += 1
-                    if not stable_slouching and slouch_on_streak >= SLOUCH_ON_STREAK:
-                        stable_slouching = True
-                else:
-                    slouch_on_streak = 0
-                    slouch_off_streak += 1
-                    if stable_slouching and slouch_off_streak >= SLOUCH_OFF_STREAK:
-                        stable_slouching = False
+                raw_bad, reasons = evaluate_posture(lm)
+                now = time.time()
+                last_reasons = reasons
 
+                if raw_bad:
+                    if bad_since is None:
+                        bad_since = now
+                    hold = now - bad_since
+                    stable_slouching = hold >= BAD_HOLD_SECONDS
+                else:
+                    bad_since = None
+                    stable_slouching = False
+                    last_reasons = set()
+
+                # Enter aiming mode only after the posture has been bad for long enough.
                 if stable_slouching:
                     if not aiming_mode:
-                        print("[POSTURE] Slouch detected — entering aiming mode...")
+                        print("[POSTURE] Bad posture confirmed — entering aiming mode...")
                         aiming_mode = True
                         fired = False
                     handle_aiming(lm, fw)
                 else:
                     if aiming_mode:
-                        print("[POSTURE] Good posture restored — exiting aiming mode.")
+                        print("[POSTURE] Posture improved — exiting aiming mode.")
                         aiming_mode = False
                         fired = False
                         stop_motor()
@@ -897,8 +898,10 @@ try:
                 if person_lost_streak >= PERSON_LOST_STREAK:
                     cached_landmarks = None
                     stable_slouching = False
+                    bad_since = None
                     slouch_on_streak = 0
                     slouch_off_streak = 0
+                    last_reasons = set()
                     if aiming_mode:
                         aiming_mode = False
                         fired = False
@@ -906,9 +909,22 @@ try:
 
         # Overlay uses same pixel size as frame (landmarks normalized to that image).
         if cached_landmarks is not None:
-            draw_posture_overlay(display_frame, cached_landmarks, stable_slouching)
-            status = "SLOUCHING" if stable_slouching else "GOOD POSTURE"
-            color = (0, 0, 255) if stable_slouching else (0, 255, 0)
+            # If confirmed-bad, use the reasons returned by evaluation (stored in `reasons`).
+            # Otherwise, don't highlight failures yet (only show warning text).
+            overlay_reasons = last_reasons if stable_slouching else set()
+            draw_posture_overlay(display_frame, cached_landmarks, stable_slouching, overlay_reasons)
+
+            if stable_slouching:
+                status = "BAD POSTURE"
+                color = (0, 0, 255)
+            elif bad_since is not None:
+                hold = time.time() - bad_since
+                remaining = max(0.0, BAD_HOLD_SECONDS - hold)
+                status = f"POSTURE WARNING ({remaining:.1f}s hold)"
+                color = (0, 165, 255)
+            else:
+                status = "GOOD POSTURE"
+                color = (0, 255, 0)
             cv2.putText(
                 display_frame,
                 status,
