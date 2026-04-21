@@ -1,47 +1,53 @@
 """
-zero_main.py - Runs on Raspberry Pi Zero 2 W
-- Captures camera feed at low resolution for performance
-- Detects slouching using MediaPipe pose detection (lite model)
-- Prints direction (LEFT / RIGHT / CENTERED) to terminal
-- Streams live video (mjpg-streamer on Pi, Flask fallback on Windows)
-- Sends commands to Pico via USB serial
+laptopPostureCheck.py — Posture monitor for Windows + Raspberry Pi OS (Linux)
 
-INSTALL REQUIREMENTS (Pi):
-    sudo apt update
-    sudo apt install -y mjpg-streamer python3-pip
-    pip install mediapipe opencv-python pyserial flask
+Same codebase runs on both:
+  • Windows laptop (dev/testing) — integrated or USB webcam (via V4L2/MSMF).
+  • Raspberry Pi Zero 2 W (deployment) — CSI Pi Camera via rpicam-vid, or
+    USB webcam on /dev/video0.
+Both platforms host the annotated live stream over HTTP (multipart MJPEG).
+MediaPipe pose runs on a background thread so the stream isn't gated by it.
 
-INSTALL REQUIREMENTS (Windows/testing):
-    pip install mediapipe opencv-python pyserial flask
+INSTALL (Windows):
+    pip install mediapipe opencv-python-headless pyserial flask
 
-ACCESS STREAM:
-    Pi:      http://10.3.141.1:5000/?action=stream
-    Windows: http://127.0.0.1:8765 (default; set STREAM_PORT if needed)
+INSTALL (Pi OS Bookworm/Trixie, 64-bit, Python 3.11/3.12 venv):
+    sudo apt install -y rpicam-apps libopenblas-dev libgl1
+    pip install mediapipe opencv-python-headless pyserial flask
+
+ACCESS STREAM (point browser at the host running this script):
+    Pi:      http://<pi-ip>:5000/
+    Windows: http://127.0.0.1:8765/   (port 5000 collides with AirPlay etc.)
+Env overrides: STREAM_PORT, CAMERA_INDEX, SERIAL_PORT.
 """
 
 import cv2
 import numpy as np
 import serial
 import time
-import subprocess
 import os
 import sys
+import socket
 import platform
 import threading
+import shutil
+import subprocess
 
 # ─────────────────────────────────────────────
-# DETECT PLATFORM
+# PLATFORM + MEDIAPIPE
 # ─────────────────────────────────────────────
 
 IS_WINDOWS = platform.system() == "Windows"
-DEBUG_MODE = IS_WINDOWS  # Automatically use debug mode on Windows
+IS_LINUX = platform.system() == "Linux"
 
-if DEBUG_MODE:
-    print("[INFO] Running in DEBUG MODE (Windows) — using Flask stream, no serial/mjpg-streamer")
-
-# ─────────────────────────────────────────────
-# MEDIAPIPE IMPORT (Windows vs Pi)
-# ─────────────────────────────────────────────
+# TFLite / XNNPACK threads = 2 on the Pi: try to parallelize inference across
+# two cores while keeping two cores cold for thermal headroom.
+if IS_LINUX:
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    os.environ.setdefault("TFLITE_NUM_THREADS", "2")
+    os.environ.setdefault("MEDIAPIPE_TFLITE_NUM_THREADS", "2")
+    os.environ.setdefault("XNNPACK_NUM_THREADS", "2")
+    os.environ.setdefault("GLOG_minloglevel", "2")
 
 try:
     import mediapipe as mp
@@ -49,54 +55,50 @@ try:
     print("[INFO] MediaPipe loaded successfully")
 except Exception as e:
     print(f"[ERROR] MediaPipe failed to load: {e}")
-    print("Run: pip install mediapipe")
+    print("Run: pip install mediapipe  (Pi OS: pip install --break-system-packages mediapipe)")
     sys.exit(1)
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 
-SERIAL_PORT = 'COM3' if IS_WINDOWS else '/dev/ttyACM0'
+SERIAL_PORT = os.environ.get(
+    "SERIAL_PORT", "COM3" if IS_WINDOWS else "/dev/ttyACM0"
+)
 BAUD_RATE = 9600
 
-FRAME_WIDTH = 320
-FRAME_HEIGHT = 240
-# Pose runs every Nth frame (1 = every frame). Overlay uses cached landmarks every frame.
-FRAME_SKIP = 2
+FRAME_WIDTH = 256
+FRAME_HEIGHT = 192
 CENTER_DEADZONE = 20
-# Require consecutive pose samples before toggling slouch state (reduces flicker).
-SLOUCH_ON_STREAK = 4
-SLOUCH_OFF_STREAK = 5
 # Drop "person lost" only after this many misses (brief occlusions recover).
 PERSON_LOST_STREAK = 4
 # Confirm bad posture only after holding it for this long (seconds).
 BAD_HOLD_SECONDS = 3.0
-# Windows often has port 5000 taken (AirPlay / other services); override with STREAM_PORT=5000 if needed.
+# Windows port 5000 often collides with AirPlay / other services; Pi is free to use 5000.
 STREAM_PORT = int(os.environ.get("STREAM_PORT", "8765" if IS_WINDOWS else "5000"))
-STREAM_FPS = 10
+STREAM_FPS = 4           # target frames/sec pushed to browser
+STREAM_JPEG_QUALITY = 35 # 0-100; lower = less bandwidth, more artifacting
 
-# Webcam index for this machine (edit here only — not overridden elsewhere)
-CAMERA_INDEX = 1
+# Webcam index (USB / integrated only — CSI Pi Camera auto-detected separately).
+CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "1" if IS_WINDOWS else "0"))
 
-# Posture (normalized 0..1, y grows downward). Webcam = mostly frontal; 2D proxies for seated cues.
-SHOULDER_BROAD_MIN = 0.15
-ELBOW_BROAD_MIN = 0.13
-# Head / neck vs shoulders
-SPINE_ANGLE_MIN_DEG = 156.0              # more forgiving: allow a bit more forward bend
-NECK_EAR_ANGLE_MIN_DEG = 150.0           # ear–mid_shoulder–mid_hip; neck too folded vs torso
-FOREHEAD_SHOULDER_CLEARANCE_MIN = 0.118
-NOSE_SHOULDER_CLEARANCE_MIN = 0.085
-TRAP_NECK_CLEARANCE_MIN = 0.058          # ears too close vertically to shoulders
-CHIN_BELOW_EAR_Y = 0.045                 # more forgiving chin down
-HEAD_OFF_CENTER_X_MAX = 0.068          # |nose.x − mid_shoulder.x| head tilted or shifted off center
-# Shoulders / torso / hips / symmetry
-SHOULDER_Y_ASYMMETRY_MAX = 0.042       # |L_shoulder.y − R_shoulder.y| uneven shoulders
-SHOULDER_HIP_HORIZONTAL_MAX = 0.052    # |mid_shoulder.x − mid_hip.x| lean or shoulders forward of hips (2D)
-TORSO_COLLAPSE_MAX = 0.095
+# Posture thresholds. Normalized landmarks (0..1, y grows downward) unless noted _DEG.
+# Webcam is mostly frontal; 2D proxies stand in for true sagittal measurements.
+# Side/torso cues (spine_angle + torso_lean only fire when hips are visible).
+SPINE_ANGLE_MIN_DEG = 156.0            # nose-mid_shoulder-mid_hip; primary spine/torso check
+SHOULDER_HIP_HORIZONTAL_MAX = 0.052    # mid_shoulder.x vs mid_hip.x; forward-lean proxy
+# Head / neck cues (work without hips)
+FOREHEAD_SHOULDER_CLEARANCE_MIN = 0.118 # face top too close to shoulders (FHP proxy)
+TRAP_NECK_CLEARANCE_MIN = 0.058        # ears too close vertically to shoulders (raised shoulders)
+CHIN_BELOW_EAR_Y = 0.045               # chin dropped below ear line
+HEAD_OFF_CENTER_X_MAX = 0.068          # |nose.x − mid_shoulder.x|; head shifted off center
+# Symmetry cues (angle-based, distance independent)
+SHOULDER_SLOPE_MAX_DEG = 5.5           # shoulder line tilt vs horizontal
+EAR_SLOPE_MAX_DEG = 6.5                # ear line tilt vs horizontal (head tilt)
+# Visibility gates
 HIP_MIN_VISIBILITY = 0.35
 NOSE_MIN_VISIBILITY = 0.2
 EAR_MIN_VISIBILITY = 0.22
-EAR_Y_ASYMMETRY_MAX = 0.035      # abs(left_ear.y - right_ear.y) for head tilt / uneven head
 FOREHEAD_VIS_MIN = 0.18
 
 # ─────────────────────────────────────────────
@@ -104,13 +106,12 @@ FOREHEAD_VIS_MIN = 0.18
 # ─────────────────────────────────────────────
 
 ser = None
-if not DEBUG_MODE:
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        time.sleep(2)
-        print(f"[SERIAL] Connected to Pico on {SERIAL_PORT}")
-    except Exception as e:
-        print(f"[SERIAL] Warning: Could not connect to Pico: {e}")
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    print(f"[SERIAL] Connected to Pico on {SERIAL_PORT}")
+except Exception as e:
+    print(f"[SERIAL] No Pico on {SERIAL_PORT} ({e}). Continuing without motor/fire commands.")
 
 # ─────────────────────────────────────────────
 # CAMERA SETUP
@@ -123,12 +124,185 @@ def _frame_brightness(frame):
     return float(np.mean(frame))
 
 
+class PiCamMJPEG:
+    """
+    cv2.VideoCapture-compatible wrapper around `rpicam-vid` for the Pi CSI
+    camera (libcamera stack on Pi OS Bookworm/Trixie). Spawns rpicam-vid as a
+    subprocess streaming MJPEG to stdout; a background reader thread drains
+    the pipe continuously and keeps only the most recent decoded BGR frame,
+    so read() always returns a near-real-time frame even when the main loop
+    (e.g. MediaPipe) runs slower than the camera's output rate.
+
+    Only the subset of the VideoCapture API this script uses is implemented:
+    read(), release(), isOpened().
+    """
+
+    _SOI = b"\xff\xd8"
+    _EOI = b"\xff\xd9"
+
+    def __init__(self, width, height, fps=15):
+        bin_name = "rpicam-vid" if shutil.which("rpicam-vid") else (
+            "libcamera-vid" if shutil.which("libcamera-vid") else None
+        )
+        if bin_name is None:
+            raise RuntimeError("rpicam-vid / libcamera-vid not installed")
+        cmd = [
+            bin_name, "-t", "0", "--codec", "mjpeg", "-o", "-",
+            "--width", str(width), "--height", str(height),
+            "--framerate", str(fps), "--nopreview", "-n",
+            "--flush",
+        ]
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0
+        )
+        self._latest = None
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._frame_id = 0
+        self._last_seen_id = 0
+        self._opened = True
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader.start()
+
+    def _reader_loop(self):
+        """Continuously parse MJPEG stream and overwrite self._latest."""
+        buf = bytearray()
+        read = self._proc.stdout.read
+        while self._opened:
+            chunk = read(65536)
+            if not chunk:
+                if self._proc.poll() is not None:
+                    break
+                continue
+            buf.extend(chunk)
+
+            while True:
+                start = buf.find(self._SOI)
+                if start < 0:
+                    buf.clear()
+                    break
+                end = buf.find(self._EOI, start + 2)
+                if end < 0:
+                    if start > 0:
+                        del buf[:start]
+                    break
+                jpeg = bytes(buf[start:end + 2])
+                del buf[:end + 2]
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+                with self._cond:
+                    self._latest = frame
+                    self._frame_id += 1
+                    self._cond.notify_all()
+
+    def isOpened(self):
+        return self._opened and self._proc.poll() is None
+
+    def set(self, *_args, **_kwargs):
+        return True
+
+    def read(self):
+        """
+        Return (ret, frame_bgr) with the latest available frame.
+        Waits up to 2s for a *new* frame (one we haven't returned before) to
+        keep timestamps monotonic; if none arrives, returns the cached one.
+        """
+        with self._cond:
+            if not self._cond.wait_for(
+                lambda: self._frame_id > self._last_seen_id or self._latest is not None,
+                timeout=2.0,
+            ):
+                return False, None
+            self._last_seen_id = self._frame_id
+            return (self._latest is not None), self._latest
+
+    def release(self):
+        self._opened = False
+        try:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        except Exception:
+            pass
+
+
+def _has_csi_camera():
+    """Best-effort check: is a libcamera-visible camera attached?"""
+    if shutil.which("rpicam-vid") is None and shutil.which("libcamera-vid") is None:
+        print("[CAMERA] rpicam-vid / libcamera-vid not found — install with: sudo apt install rpicam-apps")
+        return False
+    bin_name = "rpicam-hello" if shutil.which("rpicam-hello") else (
+        "libcamera-hello" if shutil.which("libcamera-hello") else None
+    )
+    if bin_name is None:
+        return True
+    try:
+        res = subprocess.run(
+            [bin_name, "--list-cameras"],
+            capture_output=True, text=True, timeout=5,
+        )
+        combined = (res.stdout + res.stderr).lower()
+        if "no cameras available" in combined:
+            return False
+        if res.returncode != 0 and "available cameras" not in combined:
+            return False
+        # Pull just the "0 : sensor_name ..." line for a concise summary.
+        summary = next(
+            (ln.strip() for ln in res.stdout.splitlines() if ln.strip().startswith("0 :")),
+            "camera present",
+        )
+        print(f"[CAMERA] libcamera: {summary}")
+        return True
+    except Exception as e:
+        print(f"[CAMERA] {bin_name} check failed: {e}")
+        return False
+
+
 def open_camera():
     """
     Find a capture device that actually delivers non-black frames.
     On Windows, try Media Foundation before DirectShow — DSHOW often opens a
     phantom/virtual device that reads OK but is all black.
+    On Linux, if a CSI Pi Camera is detected, stream via rpicam-vid (MJPEG).
     """
+    if IS_LINUX and _has_csi_camera():
+        try:
+            print("[CAMERA] CSI Pi Camera detected — using rpicam-vid (MJPEG)")
+            pi = PiCamMJPEG(FRAME_WIDTH, FRAME_HEIGHT, fps=6)
+            # rpicam-vid cold start can take 3-6s (libcamera init + AGC/AEC
+            # convergence). Be patient: poll up to 15s for a usable frame, with
+            # a progress dot every second so the user sees it working.
+            warmup_deadline = time.time() + 15.0
+            best = 0.0
+            last_frame = None
+            last_tick = time.time()
+            print("[CAMERA] Warming up CSI camera", end="", flush=True)
+            while time.time() < warmup_deadline:
+                ret, frm = pi.read()
+                if ret and frm is not None:
+                    last_frame = frm
+                    b = _frame_brightness(frm)
+                    if b > best:
+                        best = b
+                    if b >= 2.0:
+                        print(f"\n[CAMERA] Using CSI Pi Camera — brightness mean ≈ {b:.1f}")
+                        return pi
+                if time.time() - last_tick > 1.0:
+                    print(".", end="", flush=True)
+                    last_tick = time.time()
+                time.sleep(0.05)
+            if last_frame is not None:
+                print(f"\n[CAMERA] CSI camera warmed up but dim (best mean ≈ {best:.1f}); using it anyway")
+                return pi
+            print("\n[CAMERA] CSI camera opened but delivered no frames; falling back to V4L2")
+            pi.release()
+        except Exception as e:
+            print(f"[CAMERA] CSI Pi Camera init failed: {e}; falling back to V4L2")
+
     if CAMERA_INDEX is not None:
         try:
             indices = [int(CAMERA_INDEX)]
@@ -142,6 +316,12 @@ def open_camera():
         backends = [
             (cv2.CAP_MSMF, "Media Foundation"),
             (cv2.CAP_DSHOW, "DirectShow"),
+        ]
+    elif IS_LINUX:
+        # V4L2 is the right backend for USB webcams on Raspberry Pi OS / Linux.
+        backends = [
+            (cv2.CAP_V4L2, "V4L2"),
+            (None, "default"),
         ]
     else:
         backends = [(None, "default")]
@@ -203,8 +383,13 @@ if cap is None:
     print("[CAMERA] No usable camera — devices were missing, all-black, or unreadable.")
     if IS_WINDOWS:
         print("  • Settings → Privacy & security → Camera → allow desktop apps")
-        print("  • Quit other apps using the camera; edit CAMERA_INDEX at top of this file")
+        print("  • Quit other apps using the camera; set env CAMERA_INDEX=0/1/2")
         print("  • Integrated vs USB webcam: try another index until brightness looks right in the console")
+    elif IS_LINUX:
+        print("  • Check that a camera exists: ls /dev/video*")
+        print("  • Set env CAMERA_INDEX to match (e.g. /dev/video0 → CAMERA_INDEX=0)")
+        print("  • USB webcams work out of the box via V4L2; the CSI Pi Camera module needs")
+        print("    'sudo raspi-config' → legacy camera, or a libcamera/picamera2 adaptation")
     sys.exit(1)
 
 # ─────────────────────────────────────────────
@@ -213,116 +398,105 @@ if cap is None:
 
 pose = mp_pose.Pose(
     model_complexity=0,
-    smooth_landmarks=True,
+    smooth_landmarks=False,
     min_detection_confidence=0.5,
-    min_tracking_confidence=0.65,
+    min_tracking_confidence=0.5,
 )
 
 # ─────────────────────────────────────────────
-# STREAMING
+# STREAMING (unified Flask multipart MJPEG, works on Windows + Pi)
 # ─────────────────────────────────────────────
 
 latest_frame = None
-stream_proc = None
 
-def start_mjpg_stream():
-    """Launch mjpg-streamer on Pi (Linux only)."""
-    cmd = (
-        f"mjpg_streamer "
-        f"-i 'input_raspicam.so -fps {STREAM_FPS} -x {FRAME_WIDTH} -y {FRAME_HEIGHT}' "
-        f"-o 'output_http.so -p {STREAM_PORT} -w /usr/share/mjpg-streamer/www'"
-    )
+
+def _discover_lan_ip():
+    """Find an outbound-facing IP without actually sending. Robust to /etc/hosts loopback
+    aliases (Raspberry Pi OS maps the hostname to 127.0.1.1 by default)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        import signal
-        proc = subprocess.Popen(
-            cmd, shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid
-        )
-        time.sleep(2)
-        print(f"[STREAM] Live feed at http://10.3.141.1:{STREAM_PORT}/?action=stream")
-        return proc
-    except Exception as e:
-        print(f"[STREAM] Could not start mjpg-streamer: {e}")
-        return None
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
-def start_flask_stream():
-    """Launch lightweight Flask stream for Windows/debug."""
+
+def start_stream():
+    """HTTP server that serves an MJPEG stream with the posture overlay baked in.
+    Single long-lived connection per viewer (multipart/x-mixed-replace) — efficient
+    enough for a Pi Zero 2 W and for a laptop alike."""
     from flask import Flask, Response
 
     app = Flask(__name__)
+    # Silence the noisy per-request access log (Pi Zero benefits from less I/O too).
+    import logging
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-    def encode_jpeg(frame):
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
-        if not ok or buf is None:
-            return None
-        return buf.tobytes()
+    frame_period = 1.0 / max(1, STREAM_FPS)
+    jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY]
+    boundary = b"--frame"
 
-    @app.route("/frame.jpg")
-    def frame_jpg():
-        """Single-frame JPEG; page polls this. Encode outside any lock — main only swaps `latest_frame` ref."""
-        f = latest_frame
-        if f is None:
-            f = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-        data = encode_jpeg(f.copy())
-        if data is None:
-            return Response(status=503)
+    def mjpeg_generator():
+        placeholder = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+        while True:
+            frame = latest_frame if latest_frame is not None else placeholder
+            ok, buf = cv2.imencode(".jpg", frame, jpeg_params)
+            if ok and buf is not None:
+                payload = buf.tobytes()
+                yield (
+                    boundary + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n"
+                    + payload + b"\r\n"
+                )
+            time.sleep(frame_period)
+
+    @app.route("/stream")
+    def stream():
         return Response(
-            data,
-            mimetype="image/jpeg",
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-            },
+            mjpeg_generator(),
+            mimetype="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"},
         )
 
-    @app.route('/')
+    @app.route("/")
     def index():
-        return '''
+        return """
         <html>
         <head>
             <title>Posture Cam</title>
             <style>
                 body { background:#111; color:#eee; font-family:sans-serif; text-align:center; padding:20px; }
-                img { border:2px solid #444; border-radius:8px; max-width:100%; height:auto; }
+                img { border:2px solid #444; border-radius:8px; max-width:100%; height:auto; image-rendering: pixelated; }
+                .meta { color:#888; font-size:12px; margin-top:8px; }
             </style>
         </head>
         <body>
-            <h2>Posture Cam - Live Feed</h2>
-            <img id="cam" width="640" height="480" alt="camera feed" />
-            <script>
-            (function(){
-                var img = document.getElementById('cam');
-                var n = 0;
-                function tick() {
-                    img.src = '/frame.jpg?n=' + (++n) + '&t=' + Date.now();
-                }
-                tick();
-                setInterval(tick, 40);
-            })();
-            </script>
+            <h2>Posture Cam — Live Feed</h2>
+            <img src="/stream" alt="camera feed" />
+            <div class="meta">MJPEG stream at <code>/stream</code></div>
         </body>
-        </html>'''
+        </html>"""
 
-    import socket
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
-    print(f"[STREAM] Live feed at http://{local_ip}:{STREAM_PORT}")
-    print(f"[STREAM] Open in browser: http://127.0.0.1:{STREAM_PORT}")
+    lan_ip = _discover_lan_ip()
+    print(f"[STREAM] Live feed at http://{lan_ip}:{STREAM_PORT}/")
+    if IS_WINDOWS:
+        print(f"[STREAM] Local:          http://127.0.0.1:{STREAM_PORT}/")
 
     thread = threading.Thread(
-        target=lambda: app.run(host='0.0.0.0', port=STREAM_PORT, threaded=True, use_reloader=False),
-        daemon=True
+        target=lambda: app.run(
+            host="0.0.0.0", port=STREAM_PORT, threaded=True,
+            use_reloader=False, debug=False,
+        ),
+        daemon=True,
     )
     thread.start()
-    time.sleep(0.15)  # Let the dev server bind before the main loop / browser polls /frame.jpg
+    time.sleep(0.2)  # let the socket bind before the main loop starts producing frames
 
-# Start appropriate stream
-if DEBUG_MODE:
-    start_flask_stream()
-else:
-    stream_proc = start_mjpg_stream()
+
+start_stream()
 
 # ─────────────────────────────────────────────
 # SERIAL HELPERS
@@ -397,263 +571,88 @@ def _face_top_y(lm):
     return None
 
 
-def _angle_at_vertex_deg(ax, ay, bx, by, cx, cy):
-    """Angle at vertex B between BA and BC (degrees)."""
-    v1 = np.array([ax - bx, ay - by], dtype=np.float64)
-    v2 = np.array([cx - bx, cy - by], dtype=np.float64)
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
-    if n1 < 1e-6 or n2 < 1e-6:
-        return None
-    c = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
-    return float(np.degrees(np.arccos(c)))
-
-
-def neck_ear_torso_angle_deg(lm, mid_sx, mid_sy, mid_hx, mid_hy):
-    """Neck/torso chain using ears as head anchor (angle at mid-shoulder)."""
-    lea = lm[plm.LEFT_EAR]
-    rea = lm[plm.RIGHT_EAR]
-    if (
-        getattr(lea, "visibility", 1.0) < EAR_MIN_VISIBILITY
-        or getattr(rea, "visibility", 1.0) < EAR_MIN_VISIBILITY
-    ):
-        return None
-    emx = (lea.x + rea.x) * 0.5
-    emy = (lea.y + rea.y) * 0.5
-    return _angle_at_vertex_deg(emx, emy, mid_sx, mid_sy, mid_hx, mid_hy)
-
-
-def bad_posture(landmarks):
-    """
-    Split into two buckets (both from a single mostly-front webcam):
-    Side-view proxies (forward head, neck folding, spine curvature, torso collapse/lean):
-      - spine angle (nose–shoulder–hip)
-      - forehead/nose clearance vs shoulders
-      - trap/neck compression from ears
-      - chin-down vs ear line
-      - neck angle (ear midpoint → shoulder midpoint → hip midpoint)
-      - torso collapse (only when chest isn't broad)
-    Front-view proxies (asymmetry):
-      - shoulder height imbalance
-      - ear height imbalance (head tilt)
-      - nose off-center over shoulders
-      - shoulder/hip horizontal shift (leans to one side)
-
-    Rule: if any side-view proxy is bad => slouch.
-    Otherwise, front-view must have 2+ issues OR a shoulder-height imbalance.
-    Broad chest/elbows cancels only torso-collapse (not head/neck/head-position).
-    """
-    lm = landmarks.landmark
-    nose = lm[plm.NOSE]
-    ls = lm[plm.LEFT_SHOULDER]
-    rs = lm[plm.RIGHT_SHOULDER]
-    le = lm[plm.LEFT_ELBOW]
-    re = lm[plm.RIGHT_ELBOW]
-    lh = lm[plm.LEFT_HIP]
-    rh = lm[plm.RIGHT_HIP]
-
-    mid_sx = (ls.x + rs.x) * 0.5
-    mid_sy = (ls.y + rs.y) * 0.5
-    mid_hx = (lh.x + rh.x) * 0.5
-    mid_hy = (lh.y + rh.y) * 0.5
-
-    hip_vis = min(
-        getattr(lh, "visibility", 1.0),
-        getattr(rh, "visibility", 1.0),
-    )
-    nose_vis = getattr(nose, "visibility", 1.0)
-
-    shoulder_w = abs(ls.x - rs.x)
-    elbow_w = abs(le.x - re.x)
-    broad = shoulder_w >= SHOULDER_BROAD_MIN or elbow_w >= ELBOW_BROAD_MIN
-
-    ears_ok = False
-    lea = lm[plm.LEFT_EAR]
-    rea = lm[plm.RIGHT_EAR]
-    if (
-        getattr(lea, "visibility", 1.0) >= EAR_MIN_VISIBILITY
-        and getattr(rea, "visibility", 1.0) >= EAR_MIN_VISIBILITY
-    ):
-        ears_ok = True
-
-    # -------------------------
-    # Side-view badness
-    # -------------------------
-    side_bad = False
-
-    ang = spine_angle_deg(lm)
-    if (
-        ang is not None
-        and nose_vis >= NOSE_MIN_VISIBILITY
-        and hip_vis >= HIP_MIN_VISIBILITY
-        and ang < SPINE_ANGLE_MIN_DEG
-    ):
-        side_bad = True
-
-    face_top_y = _face_top_y(lm)
-    if face_top_y is not None and (mid_sy - face_top_y) < FOREHEAD_SHOULDER_CLEARANCE_MIN:
-        side_bad = True
-
-    if nose_vis >= NOSE_MIN_VISIBILITY and (mid_sy - nose.y) < NOSE_SHOULDER_CLEARANCE_MIN:
-        side_bad = True
-
-    if ears_ok:
-        ear_mid_y = (lea.y + rea.y) * 0.5
-        if (mid_sy - ear_mid_y) < TRAP_NECK_CLEARANCE_MIN:
-            side_bad = True
-        if nose_vis >= NOSE_MIN_VISIBILITY and (nose.y - ear_mid_y) > CHIN_BELOW_EAR_Y:
-            side_bad = True
-
-    neck_ang = neck_ear_torso_angle_deg(lm, mid_sx, mid_sy, mid_hx, mid_hy)
-    if (
-        neck_ang is not None
-        and hip_vis >= HIP_MIN_VISIBILITY
-        and neck_ang < NECK_EAR_ANGLE_MIN_DEG
-    ):
-        side_bad = True
-
-    # torso lean / hip-to-shoulder relationship proxy (2D lateral shift can happen with forward lean)
-    if hip_vis >= HIP_MIN_VISIBILITY and abs(mid_sx - mid_hx) > SHOULDER_HIP_HORIZONTAL_MAX:
-        side_bad = True
-
-    # torso collapse: only punish when chest isn't broad/open
-    if (not broad) and hip_vis >= HIP_MIN_VISIBILITY and (mid_hy - mid_sy) < TORSO_COLLAPSE_MAX:
-        side_bad = True
-
-    if side_bad:
-        return True
-
-    # -------------------------
-    # Front-view badness
-    # -------------------------
-    shoulder_asym = abs(ls.y - rs.y) > SHOULDER_Y_ASYMMETRY_MAX
-    head_offcenter = nose_vis >= NOSE_MIN_VISIBILITY and abs(nose.x - mid_sx) > HEAD_OFF_CENTER_X_MAX
-    ear_asym = ears_ok and abs(lea.y - rea.y) > EAR_Y_ASYMMETRY_MAX
-    shift_x = hip_vis >= HIP_MIN_VISIBILITY and abs(mid_sx - mid_hx) > SHOULDER_HIP_HORIZONTAL_MAX
-
-    front_count = sum([shoulder_asym, head_offcenter, ear_asym, shift_x])
-    if shoulder_asym:
-        return True
-    return front_count >= 2
+def _line_slope_deg(ax, ay, bx, by):
+    """Tilt of segment A-B vs horizontal, in degrees, always non-negative."""
+    dx = abs(bx - ax)
+    dy = abs(by - ay)
+    if dx < 1e-6:
+        return 90.0
+    return float(np.degrees(np.arctan2(dy, dx)))
 
 
 def evaluate_posture(landmarks):
     """
-    Like `bad_posture`, but also returns *which* checks failed so we can color the
-    specific nodes/lines (head vs neck/traps vs spine/torso vs front asymmetry).
-    Returns: (is_bad: bool, reasons: set[str])
+    Returns (is_bad, reasons). Two buckets:
+      Side/torso cues (any one alone => bad):
+        - spine_angle: nose-mid_shoulder-mid_hip angle < SPINE_ANGLE_MIN_DEG (hips only)
+        - forehead_dip: face top too close to shoulders (FHP, no hips needed)
+        - trap_neck:    ears too close vertically to shoulders (raised/hunched)
+        - chin_down:    chin below ear line
+        - torso_lean:   mid_shoulder horizontally offset from mid_hip (hips only)
+      Front cues (shoulder_slope alone OR 2+ signals => bad):
+        - shoulder_slope (angle), ear_slope (angle), head_offcenter
     """
     lm = landmarks.landmark
     nose = lm[plm.NOSE]
-    ls = lm[plm.LEFT_SHOULDER]
-    rs = lm[plm.RIGHT_SHOULDER]
-    le = lm[plm.LEFT_ELBOW]
-    re = lm[plm.RIGHT_ELBOW]
-    lh = lm[plm.LEFT_HIP]
-    rh = lm[plm.RIGHT_HIP]
+    ls, rs = lm[plm.LEFT_SHOULDER], lm[plm.RIGHT_SHOULDER]
+    lh, rh = lm[plm.LEFT_HIP], lm[plm.RIGHT_HIP]
+    lea, rea = lm[plm.LEFT_EAR], lm[plm.RIGHT_EAR]
 
     mid_sx = (ls.x + rs.x) * 0.5
     mid_sy = (ls.y + rs.y) * 0.5
     mid_hx = (lh.x + rh.x) * 0.5
-    mid_hy = (lh.y + rh.y) * 0.5
 
-    hip_vis = min(
-        getattr(lh, "visibility", 1.0),
-        getattr(rh, "visibility", 1.0),
-    )
+    hip_vis = min(getattr(lh, "visibility", 1.0), getattr(rh, "visibility", 1.0))
+    hips_visible = hip_vis >= HIP_MIN_VISIBILITY
     nose_vis = getattr(nose, "visibility", 1.0)
-
-    shoulder_w = abs(ls.x - rs.x)
-    elbow_w = abs(le.x - re.x)
-    broad = shoulder_w >= SHOULDER_BROAD_MIN or elbow_w >= ELBOW_BROAD_MIN
-
-    ears_ok = False
-    lea = lm[plm.LEFT_EAR]
-    rea = lm[plm.RIGHT_EAR]
-    if (
+    ears_ok = (
         getattr(lea, "visibility", 1.0) >= EAR_MIN_VISIBILITY
         and getattr(rea, "visibility", 1.0) >= EAR_MIN_VISIBILITY
-    ):
-        ears_ok = True
+    )
 
     reasons = set()
 
-    # -------------------------
-    # Side-view badness
-    # -------------------------
-    side_bad = False
-
-    ang = spine_angle_deg(lm)
-    if (
-        ang is not None
-        and nose_vis >= NOSE_MIN_VISIBILITY
-        and hip_vis >= HIP_MIN_VISIBILITY
-        and ang < SPINE_ANGLE_MIN_DEG
-    ):
-        side_bad = True
-        reasons.add("spine_angle")
+    # --- Side/torso cues ---
+    if hips_visible and nose_vis >= NOSE_MIN_VISIBILITY:
+        ang = spine_angle_deg(lm)
+        if ang is not None and ang < SPINE_ANGLE_MIN_DEG:
+            reasons.add("spine_angle")
 
     face_top_y = _face_top_y(lm)
     if face_top_y is not None and (mid_sy - face_top_y) < FOREHEAD_SHOULDER_CLEARANCE_MIN:
-        side_bad = True
         reasons.add("forehead_dip")
-
-    if nose_vis >= NOSE_MIN_VISIBILITY and (mid_sy - nose.y) < NOSE_SHOULDER_CLEARANCE_MIN:
-        side_bad = True
-        reasons.add("nose_dip")
 
     if ears_ok:
         ear_mid_y = (lea.y + rea.y) * 0.5
         if (mid_sy - ear_mid_y) < TRAP_NECK_CLEARANCE_MIN:
-            side_bad = True
             reasons.add("trap_neck")
         if nose_vis >= NOSE_MIN_VISIBILITY and (nose.y - ear_mid_y) > CHIN_BELOW_EAR_Y:
-            side_bad = True
             reasons.add("chin_down")
 
-    neck_ang = neck_ear_torso_angle_deg(lm, mid_sx, mid_sy, mid_hx, mid_hy)
-    if (
-        neck_ang is not None
-        and hip_vis >= HIP_MIN_VISIBILITY
-        and neck_ang < NECK_EAR_ANGLE_MIN_DEG
-    ):
-        side_bad = True
-        reasons.add("neck_angle")
-
-    # torso lean / hip-to-shoulder relationship proxy (2D lateral shift can happen with forward lean)
-    if hip_vis >= HIP_MIN_VISIBILITY and abs(mid_sx - mid_hx) > SHOULDER_HIP_HORIZONTAL_MAX:
-        side_bad = True
+    if hips_visible and abs(mid_sx - mid_hx) > SHOULDER_HIP_HORIZONTAL_MAX:
         reasons.add("torso_lean")
 
-    # torso collapse: only punish when chest isn't broad/open
-    if (not broad) and hip_vis >= HIP_MIN_VISIBILITY and (mid_hy - mid_sy) < TORSO_COLLAPSE_MAX:
-        side_bad = True
-        reasons.add("torso_collapse")
-
-    if side_bad:
+    strong_side = {"spine_angle", "forehead_dip", "trap_neck", "chin_down", "torso_lean"}
+    if reasons & strong_side:
         return True, reasons
 
-    # -------------------------
-    # Front-view badness (asymmetry)
-    # -------------------------
-    shoulder_asym = abs(ls.y - rs.y) > SHOULDER_Y_ASYMMETRY_MAX
+    # --- Front cues (angle-based; distance independent) ---
+    shoulder_slope = _line_slope_deg(ls.x, ls.y, rs.x, rs.y)
+    ear_slope = _line_slope_deg(lea.x, lea.y, rea.x, rea.y) if ears_ok else None
+    shoulder_bad = shoulder_slope > SHOULDER_SLOPE_MAX_DEG
+    ear_bad = ear_slope is not None and ear_slope > EAR_SLOPE_MAX_DEG
     head_offcenter = nose_vis >= NOSE_MIN_VISIBILITY and abs(nose.x - mid_sx) > HEAD_OFF_CENTER_X_MAX
-    ear_asym = ears_ok and abs(lea.y - rea.y) > EAR_Y_ASYMMETRY_MAX
-    shift_x = hip_vis >= HIP_MIN_VISIBILITY and abs(mid_sx - mid_hx) > SHOULDER_HIP_HORIZONTAL_MAX
 
-    if shoulder_asym:
-        reasons.add("shoulder_asym")
-        return True, reasons
-
+    if shoulder_bad:
+        reasons.add("shoulder_slope")
+    if ear_bad:
+        reasons.add("ear_slope")
     if head_offcenter:
         reasons.add("head_offcenter")
-    if ear_asym:
-        reasons.add("ear_asym")
-    if shift_x:
-        reasons.add("torso_lean")
 
-    front_count = sum([shoulder_asym, head_offcenter, ear_asym, shift_x])
-    if front_count >= 2:
+    if shoulder_bad:
+        return True, reasons
+    if sum([shoulder_bad, ear_bad, head_offcenter]) >= 2:
         return True, reasons
     return False, reasons
 
@@ -704,16 +703,15 @@ def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
         reasons = set()
     lm = landmarks.landmark
     h, w = frame.shape[:2]
-    head_reasons = {"forehead_dip", "nose_dip", "chin_down", "neck_angle", "trap_neck", "head_offcenter", "ear_asym"}
-    spine_reasons = {"spine_angle", "torso_collapse", "torso_lean"}
-    trap_reasons = {"trap_neck"}
-    shoulder_reasons = {"shoulder_asym"}
+    HEAD_REASONS = {"forehead_dip", "chin_down", "trap_neck", "head_offcenter", "ear_slope"}
+    SPINE_REASONS = {"spine_angle", "torso_lean"}
+    HEAD_PT_REASONS = {"forehead_dip", "chin_down", "head_offcenter"}
 
-    spine_bgr = (0, 0, 255) if (slouching and (reasons & spine_reasons)) else (0, 255, 0)
-    neck_bgr = (0, 0, 255) if (slouching and (reasons & head_reasons)) else (0, 200, 255)
+    spine_bgr = (0, 0, 255) if (slouching and (reasons & SPINE_REASONS)) else (0, 255, 0)
+    neck_bgr = (0, 0, 255) if (slouching and (reasons & HEAD_REASONS)) else (0, 200, 255)
     bone_bgr = (40, 200, 255)
     node_bgr = (200, 220, 255)
-    head_bgr = (0, 0, 255) if (slouching and (reasons & {"forehead_dip", "nose_dip", "chin_down", "head_offcenter"})) else (200, 200, 255)
+    head_bgr = (0, 0, 255) if (slouching and (reasons & HEAD_PT_REASONS)) else (200, 200, 255)
 
     for a, b in TORSO_CONNECTIONS:
         cv2.line(frame, _pt_xy(lm, a, w, h), _pt_xy(lm, b, w, h), bone_bgr, 2)
@@ -725,7 +723,7 @@ def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
     mid_s = ((ls[0] + rs[0]) // 2, (ls[1] + rs[1]) // 2)
     mid_h = ((lh[0] + rh[0]) // 2, (lh[1] + rh[1]) // 2)
     nose_pt = _pt_xy(lm, plm.NOSE, w, h)
-    trap_bgr = (0, 0, 255) if (slouching and (reasons & trap_reasons)) else ((60, 180, 255) if slouching else (200, 120, 80))
+    trap_bgr = (0, 0, 255) if (slouching and "trap_neck" in reasons) else ((60, 180, 255) if slouching else (200, 120, 80))
 
     cv2.line(frame, nose_pt, mid_s, neck_bgr, 2)
     _draw_dense_px(frame, nose_pt, mid_s, steps=5, color=(120, 200, 255), r=2)
@@ -745,7 +743,7 @@ def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
             int((lea.y + rea.y) * 0.5 * h),
         )
         cv2.line(frame, ear_mid, mid_s, (80, 180, 255), 1)
-        ear_bgr = (0, 0, 255) if (slouching and "ear_asym" in reasons) else head_bgr
+        ear_bgr = (0, 0, 255) if (slouching and "ear_slope" in reasons) else head_bgr
         cv2.circle(frame, _pt_xy(lm, plm.LEFT_EAR, w, h), 4, ear_bgr, 1)
         cv2.circle(frame, _pt_xy(lm, plm.RIGHT_EAR, w, h), 4, ear_bgr, 1)
         # Trapezius region (frontal): ears–shoulders triangle + each shoulder to neck base
@@ -766,18 +764,8 @@ def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
 
     cv2.circle(frame, nose_pt, 6, head_bgr, 2)
 
-    ang = spine_angle_deg(lm)
-    if ang is not None:
-        cv2.putText(
-            frame,
-            f"spine {ang:.0f}deg",
-            (max(4, mid_s[0] - 40), max(16, mid_s[1] - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            spine_bgr,
-            1,
-            cv2.LINE_AA,
-        )
+    # spine_angle_deg() / _line_slope_deg() still available for evaluate_posture()
+    # and any other consumers — we just no longer print them on the stream.
 
     _draw_dense_on_connections(frame, lm, w, h, TORSO_CONNECTIONS, steps=4)
 
@@ -786,9 +774,9 @@ def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
         if getattr(p, "visibility", 1.0) < 0.2:
             continue
         # Color important joints based on which check failed.
-        if idx in (plm.LEFT_SHOULDER, plm.RIGHT_SHOULDER) and (slouching and (reasons & shoulder_reasons)):
+        if idx in (plm.LEFT_SHOULDER, plm.RIGHT_SHOULDER) and slouching and "shoulder_slope" in reasons:
             c = (0, 0, 255)
-        elif idx in (plm.LEFT_HIP, plm.RIGHT_HIP) and (slouching and (reasons & {"torso_collapse", "torso_lean"})):
+        elif idx in (plm.LEFT_HIP, plm.RIGHT_HIP) and slouching and "torso_lean" in reasons:
             c = (0, 0, 255)
         else:
             c = node_bgr
@@ -800,9 +788,7 @@ def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
 
 def get_person_center_x(landmarks, w):
     lm = landmarks.landmark
-    left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
-    right_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-    center_x_norm = (left_shoulder.x + right_shoulder.x) / 2
+    center_x_norm = (lm[plm.LEFT_SHOULDER].x + lm[plm.RIGHT_SHOULDER].x) * 0.5
     return int(center_x_norm * w)
 
 fired = False
@@ -831,16 +817,129 @@ def handle_aiming(landmarks, w):
 
 print("[CAMERA] Starting posture detection... Press Ctrl+C to quit.\n")
 
-frame_count = 0
-aiming_mode = False
+# Shared state between capture loop (main thread) and pose worker thread.
+# Main thread is fast (capture + draw + stream push). Worker thread runs
+# MediaPipe on whatever raw frame is latest — stream no longer waits on it.
+pose_lock = threading.Lock()
+pose_raw_frame = None          # latest BGR frame awaiting inference
+pose_raw_id = 0                # monotonic id so worker skips stale frames
+pose_state = {
+    "cached_landmarks": None,
+    "stable_slouching": False,
+    "bad_since": None,
+    "last_reasons": set(),
+    "person_lost_streak": 0,
+    "aiming_mode": False,
+    "_last_id": 0,
+}
+pose_stop = threading.Event()
 
-cached_landmarks = None
-person_lost_streak = 0
-slouch_on_streak = 0
-slouch_off_streak = 0
-stable_slouching = False
-bad_since = None
-last_reasons = set()
+
+def pose_worker():
+    global fired
+    while not pose_stop.is_set():
+        with pose_lock:
+            if pose_raw_frame is None or pose_raw_id == pose_state["_last_id"]:
+                frame = None
+            else:
+                frame = pose_raw_frame
+                pose_state["_last_id"] = pose_raw_id
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        # Downscale for MediaPipe only — the model's input is ~256 sq anyway,
+        # so smaller input just cuts the preprocess cost. Landmarks are
+        # normalized (0-1), so they map back to any frame size for drawing.
+        h, w = frame.shape[:2]
+        small = cv2.resize(frame, (128, int(128 * h / w))) if w > 128 else frame
+        rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        t0 = time.time()
+        results = pose.process(rgb_frame)
+        now = time.time()
+        # Report BOTH inference cost (ms/call) and actual wall-clock Hz.
+        pose_worker._t_accum = getattr(pose_worker, "_t_accum", 0.0) + (now - t0)
+        pose_worker._t_n = getattr(pose_worker, "_t_n", 0) + 1
+        if not hasattr(pose_worker, "_wall_start"):
+            pose_worker._wall_start = now
+        if pose_worker._t_n >= 15:
+            avg = pose_worker._t_accum / pose_worker._t_n
+            actual_hz = pose_worker._t_n / (now - pose_worker._wall_start)
+            temp_str = ""
+            if IS_LINUX:
+                temp_c = None
+                try:
+                    with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                        temp_c = int(f.read().strip()) / 1000.0
+                except Exception:
+                    try:
+                        out = subprocess.run(
+                            ["vcgencmd", "measure_temp"],
+                            capture_output=True, text=True, timeout=1,
+                        ).stdout
+                        # Expected: "temp=53.2'C\n"
+                        temp_c = float(out.split("=")[1].split("'")[0])
+                    except Exception:
+                        pass
+                if temp_c is not None:
+                    warn = "  [HOT!]" if temp_c >= 75 else ("  [warm]" if temp_c >= 65 else "")
+                    temp_str = f" | CPU {temp_c:.1f}°C{warn}"
+            print(f"[POSE] {avg*1000:.0f}ms/inf | actual {actual_hz:.1f} Hz{temp_str}")
+            pose_worker._t_accum = 0.0
+            pose_worker._t_n = 0
+            pose_worker._wall_start = now
+
+        with pose_lock:
+            if results.pose_landmarks:
+                pose_state["person_lost_streak"] = 0
+                lm = results.pose_landmarks
+                pose_state["cached_landmarks"] = lm
+                raw_bad, reasons = evaluate_posture(lm)
+                pose_state["last_reasons"] = reasons
+
+                if raw_bad:
+                    if pose_state["bad_since"] is None:
+                        pose_state["bad_since"] = now
+                    hold = now - pose_state["bad_since"]
+                    pose_state["stable_slouching"] = hold >= BAD_HOLD_SECONDS
+                else:
+                    pose_state["bad_since"] = None
+                    pose_state["stable_slouching"] = False
+                    pose_state["last_reasons"] = set()
+
+                if pose_state["stable_slouching"]:
+                    if not pose_state["aiming_mode"]:
+                        print("[POSTURE] Bad posture confirmed — entering aiming mode...")
+                        pose_state["aiming_mode"] = True
+                        fired = False
+                    fw_local = frame.shape[1]
+                    handle_aiming(lm, fw_local)
+                else:
+                    if pose_state["aiming_mode"]:
+                        print("[POSTURE] Posture improved — exiting aiming mode.")
+                        pose_state["aiming_mode"] = False
+                        fired = False
+                        stop_motor()
+            else:
+                pose_state["person_lost_streak"] += 1
+                if pose_state["person_lost_streak"] >= PERSON_LOST_STREAK:
+                    pose_state["cached_landmarks"] = None
+                    pose_state["stable_slouching"] = False
+                    pose_state["bad_since"] = None
+                    pose_state["last_reasons"] = set()
+                    if pose_state["aiming_mode"]:
+                        pose_state["aiming_mode"] = False
+                        fired = False
+                        stop_motor()
+
+        # Idle gap between inferences. Raising this lowers the inference
+        # core's duty cycle (cools the Pi) at the cost of landmark Hz.
+        # 90 ms + ~285 ms/inference ≈ 76% duty on the hot core.
+        time.sleep(0.09)
+
+
+threading.Thread(target=pose_worker, daemon=True).start()
+
 
 try:
     while True:
@@ -853,64 +952,17 @@ try:
         if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
             frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
-        frame_count += 1
+        with pose_lock:
+            pose_raw_frame = frame
+            pose_raw_id += 1
+            cached_landmarks = pose_state["cached_landmarks"]
+            stable_slouching = pose_state["stable_slouching"]
+            bad_since = pose_state["bad_since"]
+            last_reasons = pose_state["last_reasons"]
+
         display_frame = frame.copy()
-        fw = frame.shape[1]
 
-        if frame_count % FRAME_SKIP == 0:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(rgb_frame)
-
-            if results.pose_landmarks:
-                person_lost_streak = 0
-                lm = results.pose_landmarks
-                cached_landmarks = lm
-
-                raw_bad, reasons = evaluate_posture(lm)
-                now = time.time()
-                last_reasons = reasons
-
-                if raw_bad:
-                    if bad_since is None:
-                        bad_since = now
-                    hold = now - bad_since
-                    stable_slouching = hold >= BAD_HOLD_SECONDS
-                else:
-                    bad_since = None
-                    stable_slouching = False
-                    last_reasons = set()
-
-                # Enter aiming mode only after the posture has been bad for long enough.
-                if stable_slouching:
-                    if not aiming_mode:
-                        print("[POSTURE] Bad posture confirmed — entering aiming mode...")
-                        aiming_mode = True
-                        fired = False
-                    handle_aiming(lm, fw)
-                else:
-                    if aiming_mode:
-                        print("[POSTURE] Posture improved — exiting aiming mode.")
-                        aiming_mode = False
-                        fired = False
-                        stop_motor()
-            else:
-                person_lost_streak += 1
-                if person_lost_streak >= PERSON_LOST_STREAK:
-                    cached_landmarks = None
-                    stable_slouching = False
-                    bad_since = None
-                    slouch_on_streak = 0
-                    slouch_off_streak = 0
-                    last_reasons = set()
-                    if aiming_mode:
-                        aiming_mode = False
-                        fired = False
-                        stop_motor()
-
-        # Overlay uses same pixel size as frame (landmarks normalized to that image).
         if cached_landmarks is not None:
-            # If confirmed-bad, use the reasons returned by evaluation (stored in `reasons`).
-            # Otherwise, don't highlight failures yet (only show warning text).
             overlay_reasons = last_reasons if stable_slouching else set()
             draw_posture_overlay(display_frame, cached_landmarks, stable_slouching, overlay_reasons)
 
@@ -945,20 +997,18 @@ try:
                 2,
             )
 
-        # Push to web stream (atomic ref swap; HTTP handler copies before encode)
         latest_frame = display_frame
-
-        time.sleep(0.02)
 
 except KeyboardInterrupt:
     print("\n[INFO] Stopped.")
 finally:
-    cap.release()
+    pose_stop.set()
+    try:
+        cap.release()
+    except Exception:
+        pass
     if ser:
-        ser.close()
-    if stream_proc:
         try:
-            import signal
-            os.killpg(os.getpgid(stream_proc.pid), signal.SIGTERM)
+            ser.close()
         except Exception:
             pass
