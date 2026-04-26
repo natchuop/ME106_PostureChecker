@@ -70,8 +70,8 @@ def initializeFlywheel():
     flywheel_pwm.freq(1000)  # 1 kHz PWM
 
     # Fix one direction only (no reversing)
-    in_a.value(1)
-    in_b.value(0)
+    in_a.value(0)
+    in_b.value(1)
 
     # Initially stay off (speed = 0)
     flywheel_pwm.duty_u16(0)

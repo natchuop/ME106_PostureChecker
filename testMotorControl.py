@@ -51,12 +51,16 @@ def main():
                 mcf.startCrankShaft()
                 print("Crank shaft complete.")
             elif cmd == "F":
-                print("Running flywheel sequence for 15 seconds...")
-                flywheel_end = time.ticks_add(time.ticks_ms(), 15000)
-                while time.ticks_diff(flywheel_end, time.ticks_ms()) > 0:
+                print("Running flywheel sequence...")
+                flywheel_started = False
+                while True:
                     mcf.tryFlywheel()
+                    if mcf.flywheel_active:
+                        flywheel_started = True
+                    elif flywheel_started:
+                        break  # one full cycle complete, do not restart
                     time.sleep_ms(10)
-                print("Flywheel sequence attempted (crank may start).")
+                print("Flywheel sequence complete.")
             elif cmd == "U":
                 print("Ultrasonic readout: 5x/sec for 5 seconds...")
                 for i in range(25):
