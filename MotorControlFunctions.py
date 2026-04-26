@@ -4,11 +4,7 @@ import time
 # Flywheel sequence state (non-blocking; updated by tryFlywheel each main-loop call)
 flywheel_active = False
 flywheel_t0 = 0
-
-# Crank: one blocking run per flywheel hold; step count ~= duration ms at 1 ms/step
-crank_ready = True
-total_crank_time_ms = 2048  # full steps per revolution (28BYJ-48 typical)
-CRANK_STEP_DELAY_MS = 1  # must match startCrankShaft()
+servo_at_180 = False
 
 
 def initializeUltrasonic():
@@ -79,97 +75,75 @@ def initializeFlywheel():
 
 def tryFlywheel():
     """
-    When flywheel_active is False: starts the flywheel (sets t0).
-    When True: ramp / hold using elapsed time, then blocking cooldown.
+    When flywheel_active is False: starts the flywheel (sets t0), resets servo to 0°.
+    When True: ramp up, hold at full speed, then blocking cooldown.
     After cooldown ends, flywheel_active becomes False and the next call can start again.
 
-    Ramp (non-blocking), then hold: one blocking crank rotation (startCrankShaft),
-    then blocking cooldown sleep.
-
-    
+    Servo timeline:
+      - Start of call  -> 0°
+      - Ramp complete  -> 180°
+      - 1/4 through cooldown -> back to 0°
     """
-    global flywheel_active  # true when flywheel is active, otherwise false
-    global flywheel_t0  # time when flywheel was started
-    global crank_ready
+    global flywheel_active
+    global flywheel_t0
+    global servo_at_180  # tracks whether the 180° move has been sent this cycle
 
     ramp_up_time_ms = 1000
+    hold_time_ms = 2000
     cooldown_time_ms = 5000
 
-    if not flywheel_active:  # flywheel is not active, so we start it
+    if not flywheel_active:  # starting a new cycle
         flywheel_active = True
         flywheel_t0 = time.ticks_ms()
-        crank_ready = True
+        servo_at_180 = False
+        moveCrankServo(0)
 
     current_time = time.ticks_ms()
     elapsed = time.ticks_diff(current_time, flywheel_t0)
 
-    # Hold window = time the crank shaft runs (steps * ms per step), after ramp ends
     t_ramp_end = ramp_up_time_ms
-    crank_duration_ms = total_crank_time_ms * CRANK_STEP_DELAY_MS
-    t_hold_end = t_ramp_end + crank_duration_ms
-    # conditions after activation
-    if elapsed < t_ramp_end:  # give the flywheel some time to ramp up to max speed
+    t_hold_end = t_ramp_end + hold_time_ms
+
+    if elapsed < t_ramp_end:  # ramp up to full speed
         duty = int(65535 * elapsed / ramp_up_time_ms)
         flywheel_pwm.duty_u16(duty)
-    elif elapsed < t_hold_end: # after ramp, we start the crank shaft
-        if crank_ready: # only start the crank shaft if it is ready (hasn't already been started)
-            flywheel_pwm.duty_u16(65535)
-            startCrankShaft() 
-            crank_ready = False # set the crank shaft to not ready so we don't start it again
-            flywheel_pwm.duty_u16(0)
-            time.sleep_ms(cooldown_time_ms)  # blocking cooldown
-            flywheel_active = False
-            return
+    elif elapsed < t_hold_end:  # hold at full speed
+        flywheel_pwm.duty_u16(65535)
+        if not servo_at_180:  # move servo once, right as ramp ends
+            moveCrankServo(180)
+            servo_at_180 = True
     else:
         flywheel_pwm.duty_u16(0)
+        fourth_cooldown_ms = cooldown_time_ms // 4
+        time.sleep_ms(fourth_cooldown_ms)   # wait half the cooldown
+        moveCrankServo(0)                 # return servo to home
+        time.sleep_ms(cooldown_time_ms - fourth_cooldown_ms)  # finish cooldown
+        flywheel_active = False
 
 
-def initializeCrankShaft():
-    """Initialize 4-phase stepper pins for the crank shaft motor."""
-    global crank_pins
-    crank_pins = [
-        Pin(13, Pin.OUT),  # IN1
-        Pin(12, Pin.OUT),  # IN2
-        Pin(11, Pin.OUT),  # IN3
-        Pin(10, Pin.OUT),  # IN4
-    ]
-
-    # Start with all coils off
-    for p in crank_pins:
-        p.value(0)
+# Servo pulse width bounds (µs) — adjust if your servo needs calibration
+SERVO_MIN_US = 500
+SERVO_MAX_US = 2500
+SERVO_PERIOD_US = 20000  # 50 Hz
 
 
-def startCrankShaft():
+def initializeCrankServo():
+    """Initialize micro servo PWM on GP15 at 50 Hz, defaulting to 0°."""
+    global crank_servo_pwm
+    crank_servo_pwm = PWM(Pin(15))
+    crank_servo_pwm.freq(50)
+    moveCrankServo(0)
+
+
+def moveCrankServo(deg: int):
     """
-    Blocking: one full rotation, full steps, 1 ms per step. From ~60% of steps, flywheel PWM off.
+    Move the crank servo to the requested angle (0–180°).
+    Clamps the input to the valid range before writing the pulse.
     """
-    global flywheel_pwm # we need to turn off the flywheel during the crank shaft rotation
-
-    total_steps = total_crank_time_ms
-    step_delay_ms = CRANK_STEP_DELAY_MS
-    flywheel_off_at = int(total_steps * 0.6)
-
-    sequence = [
-        (1, 0, 0, 0),
-        (0, 1, 0, 0),
-        (0, 0, 1, 0),
-        (0, 0, 0, 1),
-    ]
-
-    for step in range(total_steps): 
-        if step >= flywheel_off_at: # after 60% of the steps, we turn off the flywheel and continue with the crank shaft rotation to fully reset it
-            flywheel_pwm.duty_u16(0)
-
-        # rotate the crank shaft following the pattern
-        pattern = sequence[step % 4] 
-        for pin, value in zip(crank_pins, pattern):
-            pin.value(value)
-        time.sleep_ms(step_delay_ms)
-
-    # Release coils so motor does not hold torque
-    for p in crank_pins:
-        p.value(0)
-
+    deg = max(0, min(180, deg))
+    pulse_us = SERVO_MIN_US + int(deg / 180 * (SERVO_MAX_US - SERVO_MIN_US))
+    duty = int(pulse_us / SERVO_PERIOD_US * 65535)
+    crank_servo_pwm.duty_u16(duty)
 
 
 def initializePlatformMotor():

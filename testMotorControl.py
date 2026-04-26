@@ -18,10 +18,10 @@ def main():
     print("Initializing motors...")
     mcf.initializeFlywheel()
     mcf.initializePlatformMotor()
-    mcf.initializeCrankShaft()
+    mcf.initializeCrankServo()
     mcf.initializeUltrasonic()
     print("Ready.")
-    print("Commands: P <int>, C, F, U")
+    print("Commands: P <int>, F, C <deg>, U")
 
     poller = uselect.poll()
     poller.register(sys.stdin, uselect.POLLIN)
@@ -46,10 +46,17 @@ def main():
                         print("Invalid P command. Use: P <int>")
                 else:
                     print("Invalid P command. Use: P <int>")
-            elif cmd == "C":
-                print("Starting crank shaft...")
-                mcf.startCrankShaft()
-                print("Crank shaft complete.")
+            elif cmd.startswith("C "):
+                parts = cmd.split()
+                if len(parts) == 2:
+                    try:
+                        deg = int(parts[1])
+                        mcf.moveCrankServo(deg)
+                        print("Crank servo moved to:", deg, "deg")
+                    except ValueError:
+                        print("Invalid C command. Use: C <deg>")
+                else:
+                    print("Invalid C command. Use: C <deg>")
             elif cmd == "F":
                 print("Running flywheel sequence...")
                 flywheel_started = False
