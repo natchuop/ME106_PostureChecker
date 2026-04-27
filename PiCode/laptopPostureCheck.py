@@ -63,7 +63,7 @@ except Exception as e:
 # ─────────────────────────────────────────────
 
 SERIAL_PORT = os.environ.get(
-    "SERIAL_PORT", "COM3" if IS_WINDOWS else "/dev/ttyACM0"
+    "SERIAL_PORT", "COM10" if IS_WINDOWS else "/dev/ttyACM0"
 )
 BAUD_RATE = 9600
 
@@ -108,8 +108,13 @@ FOREHEAD_VIS_MIN = 0.18
 ser = None
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-    time.sleep(2)
     print(f"[SERIAL] Connected to Pico on {SERIAL_PORT}")
+    # Match testPicoComms.py startup handshake:
+    # 1) stop any running script in REPL, 2) soft reboot so main.py runs fresh.
+    ser.write(b"\x03")  # Ctrl+C
+    time.sleep(0.5)
+    ser.write(b"\x04")  # Ctrl+D
+    time.sleep(3.0)     # allow main.py + hardware init to complete
 except Exception as e:
     print(f"[SERIAL] No Pico on {SERIAL_PORT} ({e}). Continuing without motor/fire commands.")
 

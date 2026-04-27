@@ -11,5 +11,7 @@
     ],
     "python.analysis.extraPaths": [
         "~/.micropico-stubs/included"
-    ]
+    ],
+    "micropico.syncFolder": "PicoCode",
+    "git.ignoreLimitWarning": true
 }
