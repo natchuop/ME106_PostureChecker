@@ -66,6 +66,8 @@ SERIAL_PORT = os.environ.get(
     "SERIAL_PORT", "COM10" if IS_WINDOWS else "/dev/ttyACM0"
 )
 BAUD_RATE = 9600
+SERIAL_CONNECT_RETRIES = int(os.environ.get("SERIAL_CONNECT_RETRIES", "20"))
+SERIAL_RETRY_DELAY_S = float(os.environ.get("SERIAL_RETRY_DELAY_S", "0.6"))
 
 FRAME_WIDTH = 256
 FRAME_HEIGHT = 192
@@ -78,6 +80,7 @@ BAD_HOLD_SECONDS = 3.0
 STREAM_PORT = int(os.environ.get("STREAM_PORT", "8765" if IS_WINDOWS else "5000"))
 STREAM_FPS = 4           # target frames/sec pushed to browser
 STREAM_JPEG_QUALITY = 35 # 0-100; lower = less bandwidth, more artifacting
+FIRE_COOLDOWN_SECONDS = 8.0
 
 # Webcam index (USB / integrated only — CSI Pi Camera auto-detected separately).
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "1" if IS_WINDOWS else "0"))
@@ -104,19 +107,65 @@ FOREHEAD_VIS_MIN = 0.18
 # ─────────────────────────────────────────────
 # SERIAL SETUP
 # ─────────────────────────────────────────────
+# All reads/writes must go through `serial_lock`. Overlapping readline (reader
+# thread) and write (pose / stdin) on the same Windows COM port often triggers
+# WriteFile / PermissionError: "The device does not recognize the command."
 
 ser = None
-try:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-    print(f"[SERIAL] Connected to Pico on {SERIAL_PORT}")
-    # Match testPicoComms.py startup handshake:
-    # 1) stop any running script in REPL, 2) soft reboot so main.py runs fresh.
-    ser.write(b"\x03")  # Ctrl+C
-    time.sleep(0.5)
-    ser.write(b"\x04")  # Ctrl+D
-    time.sleep(3.0)     # allow main.py + hardware init to complete
-except Exception as e:
-    print(f"[SERIAL] No Pico on {SERIAL_PORT} ({e}). Continuing without motor/fire commands.")
+serial_lock = threading.Lock()
+
+
+def _open_serial_once():
+    return serial.Serial(
+        SERIAL_PORT,
+        BAUD_RATE,
+        timeout=0.1,
+        write_timeout=1.0,
+        rtscts=False,
+        dsrdtr=False,
+        xonxoff=False,
+    )
+
+
+def _boot_pico_main():
+    # If the Pico is in *raw* REPL, Ctrl+D does not soft-reboot. Always exit
+    # raw first, then interrupt, then soft reset so main.py runs.
+    with serial_lock:
+        ser.reset_input_buffer()
+        ser.write(b"\x02")  # Ctrl+B — normal REPL
+    time.sleep(0.2)
+    with serial_lock:
+        ser.write(b"\x03")  # Ctrl+C
+    time.sleep(0.4)
+    with serial_lock:
+        ser.write(b"\x04")  # Ctrl+D — soft reboot
+    time.sleep(3.0)  # main.py + hardware init
+
+
+for attempt in range(1, SERIAL_CONNECT_RETRIES + 1):
+    try:
+        ser = _open_serial_once()
+        print(f"[SERIAL] Connected to Pico on {SERIAL_PORT}")
+        _boot_pico_main()
+        break
+    except Exception as e:
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+            ser = None
+        if attempt < SERIAL_CONNECT_RETRIES:
+            print(
+                f"[SERIAL] Waiting for Pico on {SERIAL_PORT} "
+                f"(attempt {attempt}/{SERIAL_CONNECT_RETRIES}): {e}"
+            )
+            time.sleep(SERIAL_RETRY_DELAY_S)
+        else:
+            print(
+                f"[SERIAL] No Pico on {SERIAL_PORT} after {SERIAL_CONNECT_RETRIES} attempts "
+                f"({e}). Continuing without motor/fire commands."
+            )
 
 # ─────────────────────────────────────────────
 # CAMERA SETUP
@@ -510,20 +559,63 @@ start_stream()
 def send_command(cmd):
     if ser:
         try:
-            ser.write(f"{cmd}\n".encode())
+            # Coalesce high-rate aim commands so USB-CDC TX is not flooded.
+            now = time.time()
+            if not hasattr(send_command, "_last_move_value"):
+                send_command._last_move_value = None
+                send_command._last_move_time = 0.0
+                send_command._last_other_cmd = None
+                send_command._last_other_time = 0.0
+
+            if cmd.startswith("move:"):
+                try:
+                    move_value = int(float(cmd.split(":", 1)[1]))
+                except Exception:
+                    move_value = None
+                if move_value is not None:
+                    last_move = send_command._last_move_value
+                    dt = now - send_command._last_move_time
+                    # Drop tiny/high-frequency move updates; Pico only needs fresh snapshots.
+                    if last_move is not None and abs(move_value - last_move) < 4 and dt < 0.06:
+                        return
+                    send_command._last_move_value = move_value
+                    send_command._last_move_time = now
+            else:
+                # Suppress accidental duplicate non-move commands in short bursts.
+                if cmd == send_command._last_other_cmd and (now - send_command._last_other_time) < 0.15:
+                    return
+                send_command._last_other_cmd = cmd
+                send_command._last_other_time = now
+
+            data = f"{cmd}\n".encode()
+            with serial_lock:
+                ser.write(data)
         except Exception as e:
             print(f"[SERIAL] Error: {e}")
 
 def _serial_reader_thread():
-    """Forward any lines the Pico prints over USB serial to the laptop terminal."""
+    """Forward any lines the Pico prints over USB serial to the laptop terminal.
+    Drains in short reads under the lock (no long readline) so writes are not
+    starved and other threads are not blocked behind serial I/O.
+    """
+    buf = b""
     while True:
-        if ser:
-            try:
-                line = ser.readline().decode("utf-8", errors="replace").strip()
-                if line:
-                    print(f"[PICO] {line}")
-            except Exception:
-                pass
+        if not ser:
+            time.sleep(0.2)
+            continue
+        try:
+            with serial_lock:
+                n = ser.in_waiting
+                if n:
+                    buf += ser.read(n)
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    print(f"[PICO] {text}")
+        except Exception:
+            pass
+        time.sleep(0.01)
 
 if ser:
     threading.Thread(target=_serial_reader_thread, daemon=True).start()
@@ -540,9 +632,14 @@ def stop_motor():
     send_command("stop")
 
 def fire():
+    global next_fire_ready_at
     print("[FIRE] Firing — cooldown ~8 seconds")
     send_command("fire")
-    threading.Timer(8.0, lambda: print("[FIRE] Cooldown complete — ready to fire again")).start()
+    next_fire_ready_at = time.time() + FIRE_COOLDOWN_SECONDS
+    threading.Timer(
+        FIRE_COOLDOWN_SECONDS,
+        lambda: print("[FIRE] Cooldown complete — ready to fire again"),
+    ).start()
 
 # ─────────────────────────────────────────────
 # POSTURE (sagittal spine curvature + head / neck)
@@ -812,12 +909,18 @@ def get_person_center_x(landmarks, w):
     return int(center_x_norm * w)
 
 fired = False
+next_fire_ready_at = 0.0
 
 def handle_aiming(landmarks, w):
     global fired
     frame_center = w // 2
     person_x = get_person_center_x(landmarks, w)
     error = person_x - frame_center
+    now = time.time()
+
+    # Re-arm automatically when cooldown ends, even if posture remains BAD.
+    if fired and now >= next_fire_ready_at:
+        fired = False
 
     if abs(error) <= CENTER_DEADZONE:
         stop_motor()
@@ -900,6 +1003,14 @@ def pose_worker():
         results = pose.process(rgb_frame)
         now = time.time()
 
+        # Update shared state under pose_lock, but never call serial (handle_aiming /
+        # stop_motor) while holding it — send_command can block, which would freeze
+        # the main camera loop that also needs pose_lock.
+        aim_w = w
+        lm_aim = None
+        do_aim = False
+        do_stop_motor = False
+
         with pose_lock:
             if results.pose_landmarks:
                 pose_state["person_lost_streak"] = 0
@@ -927,13 +1038,13 @@ def pose_worker():
                         print("[AIM] Aiming...")
                         pose_state["aiming_mode"] = True
                         fired = False
-                    fw_local = frame.shape[1]
-                    handle_aiming(lm, fw_local)
+                    lm_aim = lm
+                    do_aim = True
                 else:
                     if pose_state["aiming_mode"]:
                         pose_state["aiming_mode"] = False
                         fired = False
-                        stop_motor()
+                        do_stop_motor = True
             else:
                 pose_state["person_lost_streak"] += 1
                 if pose_state["person_lost_streak"] >= PERSON_LOST_STREAK:
@@ -945,7 +1056,12 @@ def pose_worker():
                         print("[POSTURE] GOOD")
                         pose_state["aiming_mode"] = False
                         fired = False
-                        stop_motor()
+                        do_stop_motor = True
+
+        if do_stop_motor:
+            stop_motor()
+        if do_aim and lm_aim is not None:
+            handle_aiming(lm_aim, aim_w)
 
         # Idle gap between inferences. Raising this lowers the inference
         # core's duty cycle (cools the Pi) at the cost of landmark Hz.

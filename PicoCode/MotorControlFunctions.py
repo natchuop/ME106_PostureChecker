@@ -7,6 +7,11 @@ flywheel_t0 = 0
 servo_at_180 = False
 servo_returned = False   # tracks whether the servo has been walked back during cooldown
 
+# Flywheel L298N wiring (Pico GPIO numbers).
+FLYWHEEL_EN_GPIO = 27
+FLYWHEEL_IN_A_GPIO = 26
+FLYWHEEL_IN_B_GPIO = 22
+
 
 def initializeUltrasonic():
     """Initialize HC-SR04 pins (trig=GP0, echo=GP1)."""
@@ -69,10 +74,10 @@ def initializeFlywheel():
     """Initialize Pico pins for L298N flywheel control."""
     global flywheel_pwm, flywheel_in_a, flywheel_in_b
 
-    # ENA + ENB tied to GP13, IN1 + IN4 tied to Pin 31 (GP26), IN2 + IN3 tied to Pin 29 (GP22)
-    flywheel_in_a = Pin(26, Pin.OUT)
-    flywheel_in_b = Pin(22, Pin.OUT)
-    flywheel_pwm = PWM(Pin(27))
+    # ENA + ENB tied to GP13, IN1 + IN4 tied to GP26, IN2 + IN3 tied to GP22.
+    flywheel_in_a = Pin(FLYWHEEL_IN_A_GPIO, Pin.OUT)
+    flywheel_in_b = Pin(FLYWHEEL_IN_B_GPIO, Pin.OUT)
+    flywheel_pwm = PWM(Pin(FLYWHEEL_EN_GPIO))
     flywheel_pwm.freq(1000)  # 1 kHz PWM
 
     # Fix one direction only (no reversing)
@@ -99,9 +104,11 @@ def tryFlywheel():
     """
     global flywheel_active, flywheel_t0, servo_at_180, servo_returned
 
-    ramp_up_time_ms  = 1000
-    hold_time_ms     = 2000
-    cooldown_time_ms = 5000
+    ramp_up_time_ms      = 750
+    pre_fire_spin_ms     = 250   # full-speed settle time before moving servo
+    post_fire_hold_ms    = 1000  # keep wheel at speed after firing motion
+    cooldown_time_ms     = 8000
+    start_kick_duty      = 22000 # helps overcome motor stiction at spin start
 
     if not flywheel_active:  # start a new cycle
         flywheel_active  = True
@@ -113,17 +120,26 @@ def tryFlywheel():
 
     elapsed    = time.ticks_diff(time.ticks_ms(), flywheel_t0)
     t_ramp_end = ramp_up_time_ms
-    t_hold_end = t_ramp_end + hold_time_ms
+    t_fire     = t_ramp_end + pre_fire_spin_ms
+    t_hold_end = t_fire + post_fire_hold_ms
     t_srv_ret  = t_hold_end + cooldown_time_ms // 4   # when to walk servo back
     t_cycle_end = t_hold_end + cooldown_time_ms
 
     if elapsed < t_ramp_end:  # ramp up to full speed
         duty = int(65535 * elapsed / ramp_up_time_ms)
+        if duty < start_kick_duty:
+            duty = start_kick_duty
+        # Re-assert direction lines each pass so electrical noise never leaves
+        # the bridge in a coast/brake state during spin-up.
+        flywheel_in_a.value(0)
+        flywheel_in_b.value(1)
         flywheel_pwm.duty_u16(duty)
 
-    elif elapsed < t_hold_end:  # hold at full speed
+    elif elapsed < t_hold_end:  # hold at full speed (fire once after settle)
+        flywheel_in_a.value(0)
+        flywheel_in_b.value(1)
         flywheel_pwm.duty_u16(65535)
-        if not servo_at_180:
+        if not servo_at_180 and elapsed >= t_fire:
             moveCrankServo(180)
             servo_at_180 = True
 

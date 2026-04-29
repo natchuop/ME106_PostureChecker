@@ -26,16 +26,35 @@ SERIAL_PORT = os.environ.get("SERIAL_PORT", "COM10" if IS_WINDOWS else "/dev/tty
 BAUD_RATE = 9600
 
 # ── Connect ───────────────────────────────────────────────────────────────────
+# One lock for all serial I/O. On Windows, readline() in a background thread
+# concurrent with write() causes WriteFile / PermissionError on the COM port.
+
+serial_lock = threading.Lock()
 
 try:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    ser = serial.Serial(
+        SERIAL_PORT,
+        BAUD_RATE,
+        timeout=0.1,
+        write_timeout=1.0,
+        rtscts=False,
+        dsrdtr=False,
+        xonxoff=False,
+    )
     print(f"[SERIAL] Connected to Pico on {SERIAL_PORT}")
-    # Interrupt any running script (e.g. testMotorControl.py left in REPL)
-    # then soft-reboot so main.py starts fresh.
-    ser.write(b'\x03')      # Ctrl+C — stop any running script
-    time.sleep(0.5)
-    ser.write(b'\x04')      # Ctrl+D — MicroPython soft reboot → runs main.py
-    time.sleep(3)           # wait for main.py to initialize hardware
+    # If the Pico (or a previous Thonny session) is in *raw* REPL, Ctrl+D
+    # does not soft-reboot — it ends a raw transfer ("OK" / stays in raw).
+    # 1) Ctrl+B → normal REPL, 2) Ctrl+C → stop script, 3) Ctrl+D → soft reset.
+    with serial_lock:
+        ser.reset_input_buffer()
+        ser.write(b"\x02")  # Ctrl+B — exit raw REPL
+    time.sleep(0.2)
+    with serial_lock:
+        ser.write(b"\x03")  # Ctrl+C — stop any running main.py
+    time.sleep(0.4)
+    with serial_lock:
+        ser.write(b"\x04")  # Ctrl+D — soft reboot; boot → main.py
+    time.sleep(3)  # main.py + hardware init
 except Exception as e:
     print(f"[SERIAL] Could not open {SERIAL_PORT}: {e}")
     print("Set the SERIAL_PORT environment variable if your port is different.")
@@ -45,13 +64,21 @@ except Exception as e:
 # ── Background reader — prints everything the Pico sends ─────────────────────
 
 def _reader():
+    buf = b""
     while True:
         try:
-            line = ser.readline().decode("utf-8", errors="replace").strip()
-            if line:
-                print(f"[PICO] {line}")
+            with serial_lock:
+                n = ser.in_waiting
+                if n:
+                    buf += ser.read(n)
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    print(f"[PICO] {text}")
         except Exception:
             pass
+        time.sleep(0.01)
 
 threading.Thread(target=_reader, daemon=True).start()
 
@@ -60,7 +87,10 @@ threading.Thread(target=_reader, daemon=True).start()
 
 def send(cmd: str):
     try:
-        ser.write(f"{cmd}\n".encode())
+        data = f"{cmd}\n".encode()
+        with serial_lock:
+            ser.write(data)
+            ser.flush()
         print(f"[SENT] {cmd}")
     except Exception as e:
         print(f"[ERROR] {e}")
