@@ -97,9 +97,9 @@ def tryFlywheel():
     returns immediately each call so the caller can poll serial between calls.
 
     Servo timeline (all timer-based, no sleep):
-      t=0                        -> servo to 0° (home)
-      t=ramp_end                 -> servo to 180° (fire position)
-      t=hold_end + cooldown/4    -> servo back to 0°
+      t=0                        -> servo to 180° (resting)
+      t=ramp_end                 -> servo to 0° (extruded/fire position)
+      t=hold_end + cooldown/4    -> servo back to 180°
       t=hold_end + cooldown      -> cycle complete, flywheel_active = False
     """
     global flywheel_active, flywheel_t0, servo_at_180, servo_returned
@@ -115,7 +115,7 @@ def tryFlywheel():
         flywheel_t0      = time.ticks_ms()
         servo_at_180     = False
         servo_returned   = False
-        moveCrankServo(0)
+        moveCrankServo(180)
         return  # let the next call begin the ramp
 
     elapsed    = time.ticks_diff(time.ticks_ms(), flywheel_t0)
@@ -140,13 +140,13 @@ def tryFlywheel():
         flywheel_in_b.value(1)
         flywheel_pwm.duty_u16(65535)
         if not servo_at_180 and elapsed >= t_fire:
-            moveCrankServo(180)
+            moveCrankServo(0)
             servo_at_180 = True
 
     else:  # cooldown — motor already off; just manage servo return and cycle end
         flywheel_pwm.duty_u16(0)
         if not servo_returned and elapsed >= t_srv_ret:
-            moveCrankServo(0)
+            moveCrankServo(180)
             servo_returned = True
         if elapsed >= t_cycle_end:
             flywheel_active = False
@@ -159,19 +159,29 @@ SERVO_PERIOD_US = 20000  # 50 Hz
 
 
 def initializeCrankServo():
-    """Initialize micro servo PWM on GP15 at 50 Hz, defaulting to 0°."""
+    """Initialize micro servo PWM on GP15, then run startup sweep 180° -> 0° -> 180°."""
     global crank_servo_pwm
     crank_servo_pwm = PWM(Pin(15))
     crank_servo_pwm.freq(50)
+    moveCrankServo(180)
+    time.sleep_ms(350)
     moveCrankServo(0)
+    time.sleep_ms(350)
+    moveCrankServo(180)
 
 
 def moveCrankServo(deg: int):
     """
     Move the crank servo to the requested angle (0–180°).
-    Clamps the input to the valid range before writing the pulse.
+    180° is resting; 0° is extruded.
+    For extrude requests (0°), pre-position at 180° first, then move to 0°.
     """
     deg = max(0, min(180, deg))
+    if deg == 0:
+        rest_pulse_us = SERVO_MIN_US + int(180 / 180 * (SERVO_MAX_US - SERVO_MIN_US))
+        rest_duty = int(rest_pulse_us / SERVO_PERIOD_US * 65535)
+        crank_servo_pwm.duty_u16(rest_duty)
+        time.sleep_ms(120)
     pulse_us = SERVO_MIN_US + int(deg / 180 * (SERVO_MAX_US - SERVO_MIN_US))
     duty = int(pulse_us / SERVO_PERIOD_US * 65535)
     crank_servo_pwm.duty_u16(duty)
