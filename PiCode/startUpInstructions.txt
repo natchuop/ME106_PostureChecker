@@ -60,6 +60,8 @@ SETUP B: Raspberry Pi Zero 2 W + Pico
 ONE-TIME SETUP (after a fresh Pi OS flash)
 -------------------------------------------
 
+Use Raspberry Pi OS 64-bit (Bookworm/Trixie). MediaPipe wheels are not reliable on 32-bit OS.
+
 sudo apt update
 
 sudo apt install -y rpicam-apps libopenblas-dev libgl1 v4l-utils cpufrequtils curl
@@ -84,7 +86,7 @@ EVERY BOOT
 
 sudo cpufreq-set -g ondemand
 
-cd ~/Project
+cd ~/Project/PiCode
 
 ~/posture-venv/bin/python laptopPostureCheck.py
 # Open http://<pi-ip>:5000/ in a browser to view the live feed.

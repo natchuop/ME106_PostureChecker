@@ -442,8 +442,8 @@ if cap is None:
     elif IS_LINUX:
         print("  • Check that a camera exists: ls /dev/video*")
         print("  • Set env CAMERA_INDEX to match (e.g. /dev/video0 → CAMERA_INDEX=0)")
-        print("  • USB webcams work out of the box via V4L2; the CSI Pi Camera module needs")
-        print("    'sudo raspi-config' → legacy camera, or a libcamera/picamera2 adaptation")
+        print("  • USB webcams work out of the box via V4L2; CSI cameras need libcamera/rpicam")
+        print("    (install with: sudo apt install rpicam-apps)")
     sys.exit(1)
 
 # ─────────────────────────────────────────────
