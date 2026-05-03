@@ -63,7 +63,7 @@ except Exception as e:
 # ─────────────────────────────────────────────
 
 SERIAL_PORT = os.environ.get(
-    "SERIAL_PORT", "COM10" if IS_WINDOWS else "/dev/ttyACM0"
+    "SERIAL_PORT", "COM7" if IS_WINDOWS else "/dev/ttyACM0"
 )
 BAUD_RATE = 9600
 SERIAL_CONNECT_RETRIES = int(os.environ.get("SERIAL_CONNECT_RETRIES", "20"))
@@ -71,7 +71,12 @@ SERIAL_RETRY_DELAY_S = float(os.environ.get("SERIAL_RETRY_DELAY_S", "0.6"))
 
 FRAME_WIDTH = 256
 FRAME_HEIGHT = 192
-CENTER_DEADZONE = 5
+# Aiming thresholds:
+# - fire only when target is very close to center (pixels)
+# - move only when target is clearly off-center in pixels
+FIRE_DEADZONE_PIXELS = 10
+AIM_PIXELS_TO_DEG = 0.20  # keep in sync with PicoCode/MotorControlFunctions.py
+MOVE_DEADBAND_PIXELS = 10
 # Drop "person lost" only after this many misses (brief occlusions recover).
 PERSON_LOST_STREAK = 4
 # Confirm bad posture only after holding it for this long (seconds).
@@ -166,6 +171,13 @@ for attempt in range(1, SERIAL_CONNECT_RETRIES + 1):
                 f"[SERIAL] No Pico on {SERIAL_PORT} after {SERIAL_CONNECT_RETRIES} attempts "
                 f"({e}). Continuing without motor/fire commands."
             )
+
+# Inference/aiming run only while this flag is set. Cleared when Pico prints a
+# line containing "entering home mode"; set again on "home complete" or "home set:".
+# Without serial, tracking is always on.
+posture_tracking_enabled = threading.Event()
+if not ser:
+    posture_tracking_enabled.set()
 
 # ─────────────────────────────────────────────
 # CAMERA SETUP
@@ -556,42 +568,65 @@ start_stream()
 # SERIAL HELPERS
 # ─────────────────────────────────────────────
 
+def _serial_always_send_raw(cmd: str) -> bool:
+    """Homing jogs and critical commands must not be dropped by duplicate-suppression."""
+    c = (cmd or "").strip().lower()
+    if c in ("home", "h", "on", "off", "stop", "fire", "ultrasonic"):
+        return True
+    try:
+        float(c)
+        return True
+    except ValueError:
+        return False
+
+
 def send_command(cmd):
-    if ser:
-        try:
-            # Coalesce high-rate aim commands so USB-CDC TX is not flooded.
-            now = time.time()
-            if not hasattr(send_command, "_last_move_value"):
-                send_command._last_move_value = None
-                send_command._last_move_time = 0.0
-                send_command._last_other_cmd = None
-                send_command._last_other_time = 0.0
+    if not ser:
+        if not getattr(send_command, "_warned_none", False):
+            print("[SERIAL] No Pico serial — commands are not sent. Set SERIAL_PORT or connect USB.")
+            send_command._warned_none = True
+        return
+    try:
+        # Coalesce high-rate aim commands so USB-CDC TX is not flooded.
+        now = time.time()
+        if not hasattr(send_command, "_last_move_value"):
+            send_command._last_move_value = None
+            send_command._last_move_time = 0.0
+            send_command._last_other_cmd = None
+            send_command._last_other_time = 0.0
 
-            if cmd.startswith("move:"):
-                try:
-                    move_value = int(float(cmd.split(":", 1)[1]))
-                except Exception:
-                    move_value = None
-                if move_value is not None:
-                    last_move = send_command._last_move_value
-                    dt = now - send_command._last_move_time
-                    # Drop tiny/high-frequency move updates; Pico only needs fresh snapshots.
-                    if last_move is not None and abs(move_value - last_move) < 4 and dt < 0.06:
-                        return
-                    send_command._last_move_value = move_value
-                    send_command._last_move_time = now
-            else:
-                # Suppress accidental duplicate non-move commands in short bursts.
-                if cmd == send_command._last_other_cmd and (now - send_command._last_other_time) < 0.15:
+        if cmd.startswith("move:"):
+            try:
+                move_value = int(float(cmd.split(":", 1)[1]))
+            except Exception:
+                move_value = None
+            if move_value is not None:
+                last_move = send_command._last_move_value
+                dt = now - send_command._last_move_time
+                # Pico now executes blocking jogs per move command, so throttle
+                # host move updates to avoid queuing stale corrections.
+                if last_move is not None and abs(move_value - last_move) < 8 and dt < 0.25:
                     return
-                send_command._last_other_cmd = cmd
-                send_command._last_other_time = now
+                send_command._last_move_value = move_value
+                send_command._last_move_time = now
+        elif not _serial_always_send_raw(cmd):
+            if cmd == send_command._last_other_cmd and (now - send_command._last_other_time) < 0.15:
+                return
+            send_command._last_other_cmd = cmd
+            send_command._last_other_time = now
+        else:
+            send_command._last_other_cmd = cmd
+            send_command._last_other_time = now
 
-            data = f"{cmd}\n".encode()
-            with serial_lock:
-                ser.write(data)
-        except Exception as e:
-            print(f"[SERIAL] Error: {e}")
+        data = f"{cmd}\n".encode()
+        with serial_lock:
+            ser.write(data)
+            try:
+                ser.flush()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[SERIAL] Error: {e}")
 
 def _serial_reader_thread():
     """Forward any lines the Pico prints over USB serial to the laptop terminal.
@@ -613,14 +648,23 @@ def _serial_reader_thread():
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
                     print(f"[PICO] {text}")
+                    low = text.lower()
+                    if "entering home mode" in low:
+                        posture_tracking_enabled.clear()
+                        print("[HOMING] Posture/aiming paused — camera still live.")
+                        with pose_lock:
+                            pose_state["cached_landmarks"] = None
+                            pose_state["stable_slouching"] = False
+                            pose_state["bad_since"] = None
+                            pose_state["last_reasons"] = set()
+                            pose_state["aiming_mode"] = False
+                            pose_state["person_lost_streak"] = 0
+                    if "home complete" in low or "home set:" in low:
+                        posture_tracking_enabled.set()
+                        print("[HOMING] Posture tracking enabled.")
         except Exception:
             pass
         time.sleep(0.01)
-
-if ser:
-    threading.Thread(target=_serial_reader_thread, daemon=True).start()
-    send_command("off")   # ensure Pico starts in off state
-    print("[CONTROL] Pico defaulting to OFF — type 'on' to activate")
 
 def rotate_left(error):
     send_command(f"move:{error}")
@@ -922,13 +966,16 @@ def handle_aiming(landmarks, w):
     if fired and now >= next_fire_ready_at:
         fired = False
 
-    if abs(error) <= CENTER_DEADZONE:
+    if abs(error) <= FIRE_DEADZONE_PIXELS:
         stop_motor()
         if not fired:
             print(f"[AIM] Centered (error: {error}px) — firing")
             time.sleep(0.2)
             fire()
             fired = True
+    elif abs(error) <= MOVE_DEADBAND_PIXELS:
+        # Close enough in image space: hold position and avoid jitter.
+        stop_motor()
     elif error < 0:
         rotate_left(error)
     else:
@@ -941,18 +988,18 @@ def handle_aiming(landmarks, w):
 # command to the Pico over serial.  Non-blocking relative to the camera loop.
 
 def _pico_control_thread():
-    """Read stdin for 'on'/'off' and send to Pico.  Runs as a daemon thread."""
-    print("[CONTROL] Type 'on' or 'off' to start/stop the Pico. (default: off)")
+    """Read stdin for control commands and send to Pico. Runs as a daemon thread."""
+    print("[CONTROL] Type Pico commands here (e.g., h, on, off, +5, -10, home)")
     while True:
         try:
             cmd = input().strip().lower()
         except EOFError:
             break
-        if cmd in ("on", "off"):
-            print(f"[CONTROL] Sending '{cmd}' to Pico")
-            send_command(cmd)
-        else:
-            print(f"[CONTROL] Unknown: '{cmd}' — use 'on' or 'off'")
+        if not cmd:
+            continue
+        # Pass through raw command so homing jog inputs (+/-deg) reach Pico.
+        print(f"[CONTROL] Sending '{cmd}' to Pico")
+        send_command(cmd)
 
 threading.Thread(target=_pico_control_thread, daemon=True).start()
 
@@ -960,11 +1007,13 @@ threading.Thread(target=_pico_control_thread, daemon=True).start()
 # MAIN LOOP
 # ─────────────────────────────────────────────
 
-print("[CAMERA] Starting posture detection... Press Ctrl+C to quit.\n")
+print(
+    "[CAMERA] Starting camera + stream. During Pico homing, live video runs but "
+    "posture tracking and aiming stay off until you see [HOMING] Posture tracking enabled.\n"
+    "Press Ctrl+C to quit.\n"
+)
 
-# Shared state between capture loop (main thread) and pose worker thread.
-# Main thread is fast (capture + draw + stream push). Worker thread runs
-# MediaPipe on whatever raw frame is latest — stream no longer waits on it.
+# Shared state between capture loop (background thread) and pose worker thread.
 pose_lock = threading.Lock()
 pose_raw_frame = None          # latest BGR frame awaiting inference
 pose_raw_id = 0                # monotonic id so worker skips stale frames
@@ -978,11 +1027,16 @@ pose_state = {
     "_last_id": 0,
 }
 pose_stop = threading.Event()
+camera_shutdown = threading.Event()
 
 
 def pose_worker():
     global fired
     while not pose_stop.is_set():
+        if not posture_tracking_enabled.is_set():
+            fired = False
+            time.sleep(0.05)
+            continue
         with pose_lock:
             if pose_raw_frame is None or pose_raw_id == pose_state["_last_id"]:
                 frame = None
@@ -999,7 +1053,6 @@ def pose_worker():
         h, w = frame.shape[:2]
         small = cv2.resize(frame, (128, int(128 * h / w))) if w > 128 else frame
         rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        t0 = time.time()
         results = pose.process(rgb_frame)
         now = time.time()
 
@@ -1072,14 +1125,15 @@ def pose_worker():
 threading.Thread(target=pose_worker, daemon=True).start()
 
 
-try:
-    while True:
+def _camera_capture_loop():
+    """Runs in background so HTTP stream + frames stay alive during Pico homing."""
+    global latest_frame, pose_raw_frame, pose_raw_id  # Flask + pose_worker use these
+    while not camera_shutdown.is_set():
         ret, frame = cap.read()
         if not ret:
             print("[CAMERA] Read failed")
             break
 
-        # Match requested size so MediaPipe norms line up with drawing (drivers often ignore WxH).
         if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
             frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
@@ -1092,8 +1146,20 @@ try:
             last_reasons = pose_state["last_reasons"]
 
         display_frame = frame.copy()
+        tracking = posture_tracking_enabled.is_set()
 
-        if cached_landmarks is not None:
+        if not tracking:
+            cv2.putText(
+                display_frame,
+                "HOMING IN PROGRESS",
+                (8, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.64,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        elif cached_landmarks is not None:
             overlay_reasons = last_reasons if stable_slouching else set()
             draw_posture_overlay(display_frame, cached_landmarks, stable_slouching, overlay_reasons)
 
@@ -1130,10 +1196,32 @@ try:
 
         latest_frame = display_frame
 
+
+cam_thread = threading.Thread(target=_camera_capture_loop, daemon=True)
+cam_thread.start()
+time.sleep(0.3)
+
+if ser:
+    threading.Thread(target=_serial_reader_thread, daemon=True).start()
+    send_command("on")
+    time.sleep(0.15)
+    send_command("stop")  # clear Pico latest_move before blocking homing (matches main.py)
+    time.sleep(0.05)
+    send_command("h")
+    print(
+        "[CONTROL] Startup: sent 'on', 'stop', then 'h'. "
+        "Camera is live — finish homing in this terminal."
+    )
+
+try:
+    while True:
+        time.sleep(0.25)
 except KeyboardInterrupt:
     print("\n[INFO] Stopped.")
 finally:
     pose_stop.set()
+    camera_shutdown.set()
+    cam_thread.join(timeout=3.0)
     try:
         cap.release()
     except Exception:

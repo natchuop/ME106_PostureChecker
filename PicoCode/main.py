@@ -1,12 +1,13 @@
 """
-postureCheckWithMotors.py — Runs on Raspberry Pi Pico (MicroPython)
+main.py — Posture Checker motor firmware (MicroPython on Raspberry Pi Pico)
 
 Receives \n-delimited commands from the host (Raspberry Pi or Windows laptop)
 over USB serial:
 
     on          — enable the active loop
     off         — disable the active loop
-    move:<int>  — rotate the platform (positive = right, negative = left)
+    h           — enter blocking platform homing mode
+    move:<int>  — image error in pixels; converted to bounded jog degrees on Pico
     fire        — trigger the flywheel/servo sequence
 
 Loop structure:
@@ -29,6 +30,26 @@ _poll = select.poll()
 _poll.register(sys.stdin, select.POLLIN)
 
 
+def _blocking_home_sequence():
+    """
+    Blocking readline-based homing in MotorControlFunctions.homePlatformMotor()
+    conflicts with stdin being registered on uselect.poll(). Temporarily
+    unregister for homing, then restore. (Handles MicroPython stdout without
+    flush().)
+    """
+    try:
+        _poll.unregister(sys.stdin)
+    except OSError:
+        pass
+    try:
+        mcf.homePlatformMotor()
+    finally:
+        try:
+            _poll.register(sys.stdin, select.POLLIN)
+        except OSError:
+            pass
+
+
 def _read_command():
     """
     Return the next complete \\n-terminated command string, or None if no full
@@ -49,7 +70,7 @@ def _initialize():
     mcf.initializeFlywheel()
     mcf.initializeCrankServo()
     mcf.initializePlatformMotor()
-    print("Pico ready. Waiting for 'on'...")
+    print("Pico ready. Send 'on' then 'h' to home the platform.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -59,7 +80,6 @@ def main():
 
     active       = False   # True while host has sent 'on'
     fire_pending = False   # True when a 'fire' command is queued
-    latest_move  = 0       # most recent move:<int> value from host
     proximity_blocked = False
     block_threshold_ft = 0.5
     clear_threshold_ft = 0.6  # hysteresis: require more clearance to exit blocked
@@ -70,9 +90,12 @@ def main():
         if cmd == "on":
             active = True
             fire_pending = False
-            latest_move  = 0
             proximity_blocked = False
             print("Active.")
+        elif cmd == "h":
+            print("Entering HOME MODE (jog +/- degrees, then type 'home').")
+            _blocking_home_sequence()
+            print("HOME complete.")
         elif cmd == "ultrasonic":
             dist = mcf.readUltrasonic()
             if dist == -1:
@@ -91,14 +114,20 @@ def main():
             if cmd == "off":
                 active = False
                 proximity_blocked = False
-                mcf.rotatePlatform(0)
+                mcf.stopPlatformMotor()
                 print("Inactive.")
                 break
             elif cmd == "stop":
-                latest_move = 0
+                mcf.stopPlatformMotor()
+            elif cmd == "h":
+                print("Entering HOME MODE (jog +/- degrees, then type 'home').")
+                mcf.stopPlatformMotor()
+                _blocking_home_sequence()
+                print("HOME complete. Staying active.")
             elif cmd is not None and cmd.startswith("move:"):
                 try:
-                    latest_move = int(cmd[5:])
+                    pixel_error = int(cmd[5:])
+                    mcf.jogPlatformPixelsBlocking(pixel_error, duty=60000, timeout_ms=4000)
                 except ValueError:
                     pass
             elif cmd == "fire":
@@ -126,7 +155,7 @@ def main():
                     print("BLOCKED — object too close, pausing.")
                     proximity_blocked = True
                 # While blocked: keep motors stopped, then re-check next loop pass.
-                mcf.rotatePlatform(0)
+                mcf.stopPlatformMotor()
                 if mcf.flywheel_active:
                     mcf.stopFlywheel()
                 time.sleep_ms(50)
@@ -136,10 +165,6 @@ def main():
                 print("CLEAR — resuming.")
 
             # ── Actual motor code (ultrasonic clear) ──────────────────────────
-
-            # Rotate platform toward the target
-            mcf.rotatePlatform(latest_move)
-
             # Advance flywheel state machine (non-blocking every loop pass)
             if mcf.flywheel_active:
                 mcf.tryFlywheel()

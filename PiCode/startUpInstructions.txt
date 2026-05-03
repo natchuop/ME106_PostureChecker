@@ -45,7 +45,7 @@ EVERY SESSION
 
    cd "C:\Users\natch\Desktop\School\ME106_Mechatronics\PostureChecker"
    .venv\Scripts\activate.bat
-   set SERIAL_PORT=COM10
+   set SERIAL_PORT=COM7
    cd PiCode
    python laptopPostureCheck.py
 

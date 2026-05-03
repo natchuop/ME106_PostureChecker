@@ -18,20 +18,18 @@ def main():
     print("Initializing motors...")
     mcf.initializeFlywheel()
     mcf.initializePlatformMotor()
+    # Declares current shaft position as 0° so P jog commands work immediately.
+    # (same idea as typing 'home' after jog — see H below).
+    mcf.setPlatformHomeHere()
     mcf.initializeCrankServo()
     mcf.initializeUltrasonic()
     print("Ready.")
-    print("Commands: P <int>, F, C <deg>, U")
+    print("Commands: P <deg>, H (re-home / jog), F, C <deg>, U")
 
     poller = uselect.poll()
     poller.register(sys.stdin, uselect.POLLIN)
 
-    last_platform_distance = 0
-
     while True:
-        # Keep platform continuously updated with latest distance command.
-        mcf.rotatePlatform(last_platform_distance)
-
         cmd = _read_command_nonblocking(poller)
         if cmd is not None:
             if not cmd:
@@ -40,12 +38,22 @@ def main():
                 parts = cmd.split()
                 if len(parts) == 2:
                     try:
-                        last_platform_distance = int(parts[1])
-                        print("Platform distance set to:", last_platform_distance)
+                        jog_deg = int(parts[1])
+                        ok = mcf.jogPlatformDegBlocking(jog_deg, duty=30000, timeout_ms=4000)
+                        if not ok:
+                            print("Platform not homed. Use H then type home to set zero.")
+                        else:
+                            print(
+                                "Platform jogged by:",
+                                jog_deg,
+                                "deg | angle now:",
+                                round(mcf.getPlatformAngleDeg(), 2),
+                                "deg",
+                            )
                     except ValueError:
-                        print("Invalid P command. Use: P <int>")
+                        print("Invalid P command. Use: P <deg>")
                 else:
-                    print("Invalid P command. Use: P <int>")
+                    print("Invalid P command. Use: P <deg>")
             elif cmd.startswith("C "):
                 parts = cmd.split()
                 if len(parts) == 2:
@@ -78,6 +86,10 @@ def main():
                         print("U", i + 1, ":", round(distance_ft, 3), "ft")
                     time.sleep_ms(200)
                 print("Ultrasonic readout complete.")
+            elif cmd.upper() == "H":
+                print("Entering platform homing mode (blocking)...")
+                mcf.homePlatformMotor()
+                print("Homing complete.")
             else:
                 print("Unknown command:", cmd)
 
