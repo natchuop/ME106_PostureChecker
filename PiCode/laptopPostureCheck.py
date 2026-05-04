@@ -402,8 +402,10 @@ def start_stream():
 
     def mjpeg_generator():
         placeholder = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+
         while True:
             frame = latest_frame if latest_frame is not None else placeholder
+
             ok, buf = cv2.imencode(".jpg", frame, jpeg_params)
             if ok and buf is not None:
                 payload = buf.tobytes()
@@ -413,26 +415,15 @@ def start_stream():
                     b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n"
                     + payload + b"\r\n"
                 )
+
             time.sleep(frame_period)
 
     @app.route("/")
     def index():
-        return """
-        <html>
-        <head>
-            <title>Posture Cam</title>
-            <style>
-                body { background:#111; color:#eee; font-family:sans-serif; text-align:center; padding:20px; }
-                img { border:2px solid #444; border-radius:8px; max-width:100%; height:auto; image-rendering: pixelated; }
-                .meta { color:#888; font-size:12px; margin-top:8px; }
-            </style>
-        </head>
-        <body>
-            <h2>Posture Cam — Live Feed</h2>
-            <img src="/stream" alt="camera feed" />
-            <div class="meta">MJPEG stream at <code>/stream</code></div>
-        </body>
-        </html>"""
+        return Response(
+            mjpeg_generator(),
+            mimetype="multipart/x-mixed-replace; boundary=frame"
+        )
 
     lan_ip = _discover_lan_ip()
     print(f"[STREAM] Live feed at http://{lan_ip}:{STREAM_PORT}/")
@@ -441,8 +432,11 @@ def start_stream():
 
     thread = threading.Thread(
         target=lambda: app.run(
-            host="0.0.0.0", port=STREAM_PORT, threaded=True,
-            use_reloader=False, debug=False,
+            host="0.0.0.0",
+            port=STREAM_PORT,
+            threaded=True,
+            use_reloader=False,
+            debug=False,
         ),
         daemon=True,
     )
