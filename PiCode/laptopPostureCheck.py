@@ -44,8 +44,8 @@ FRAME_HEIGHT = 192
 PERSON_LOST_STREAK = 4
 BAD_HOLD_SECONDS = 3.0
 STREAM_PORT = int(os.environ.get("STREAM_PORT", "8765" if IS_WINDOWS else "5000"))
-STREAM_FPS = 4
-STREAM_JPEG_QUALITY = 30
+STREAM_FPS = 5
+STREAM_JPEG_QUALITY = 25
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "1" if IS_WINDOWS else "0"))
 
 amUsingUltrasonicSensor = 0  # 1 = use Pico ultrasonic lines for banner/range; 0 = not wired
@@ -63,7 +63,7 @@ NOSE_MIN_VISIBILITY = 0.2
 EAR_MIN_VISIBILITY = 0.22
 FOREHEAD_VIS_MIN = 0.18
 
-AIM_DEADBAND_PX = 7
+AIM_DEADBAND_PX = 12
 AIM_CENTER_HOLD_SECONDS = 1.0
 FLYWHEEL_CYCLE_TIME_MS = 10000
 
@@ -255,7 +255,7 @@ def open_camera():
     if IS_LINUX and _has_csi_camera():
         try:
             print("[CAMERA] CSI Pi Camera detected — using rpicam-vid (MJPEG)")
-            pi = PiCamMJPEG(FRAME_WIDTH, FRAME_HEIGHT, fps=4)
+            pi = PiCamMJPEG(FRAME_WIDTH, FRAME_HEIGHT, fps=5)
             warmup_deadline = time.time() + 15.0
             best = 0.0
             last_frame = None
@@ -917,9 +917,9 @@ def pose_worker():
 
                         # Inverted because platform direction is reversed
                         if _error_px < 0:
-                            send_command("P,20")
+                            send_command("P,15")
                         elif _error_px > 0:
-                            send_command("P,-20")
+                            send_command("P,-15")
             else:
                 if not results.pose_landmarks:
                     send_command("stop")
