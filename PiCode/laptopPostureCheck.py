@@ -48,7 +48,7 @@ STREAM_FPS = 4
 STREAM_JPEG_QUALITY = 35
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "1" if IS_WINDOWS else "0"))
 
-amUsingUltrasonicSensor = True
+amUsingUltrasonicSensor = 0  # 1 = use Pico ultrasonic lines for banner/range; 0 = not wired
 
 SPINE_ANGLE_MIN_DEG = 156.0
 SHOULDER_HIP_HORIZONTAL_MAX = 0.052
@@ -62,6 +62,9 @@ HIP_MIN_VISIBILITY = 0.35
 NOSE_MIN_VISIBILITY = 0.2
 EAR_MIN_VISIBILITY = 0.22
 FOREHEAD_VIS_MIN = 0.18
+
+AIM_DEADBAND_PX = 7
+FLYWHEEL_CYCLE_TIME_MS = 10000
 
 ser = None
 serial_lock = threading.Lock()
@@ -118,8 +121,6 @@ for attempt in range(1, SERIAL_CONNECT_RETRIES + 1):
             )
 
 posture_tracking_enabled = threading.Event()
-if not ser:
-    posture_tracking_enabled.set()
 
 
 def _frame_brightness(frame):
@@ -523,7 +524,12 @@ def _serial_reader_thread():
                 if text:
                     print(f"[PICO] {text}")
                     low = text.lower()
-                    if "entering home mode" in low:
+                    if "home set:" in low:
+                        posture_tracking_enabled.set()
+                        print("[HOMING] Posture tracking enabled.")
+                        send_command("on")
+                        print("[CONTROL] Sent 'on' — motors activated.")
+                    elif "entering home mode" in low:
                         posture_tracking_enabled.clear()
                         print("[HOMING] Posture tracking paused — camera still live.")
                         with pose_lock:
@@ -532,9 +538,6 @@ def _serial_reader_thread():
                             pose_state["bad_since"] = None
                             pose_state["last_reasons"] = set()
                             pose_state["person_lost_streak"] = 0
-                    elif "home complete" in low or "home set:" in low:
-                        posture_tracking_enabled.set()
-                        print("[HOMING] Posture tracking enabled.")
                     elif amUsingUltrasonicSensor and text == "USONIC_WEB:out_of_range":
                         with pose_lock:
                             pose_state["ultrasonic_banner"] = "TARGET OUT OF RANGE"
@@ -802,6 +805,7 @@ pose_state = {
     "steady_bad_announced": False,
     "_last_id": 0,
     "ultrasonic_banner": None,
+    "fire_cooldown_until": 0.0,
 }
 pose_stop = threading.Event()
 camera_shutdown = threading.Event()
@@ -848,6 +852,7 @@ def pose_worker():
                     pose_state["bad_since"] = None
                     pose_state["stable_slouching"] = False
                     pose_state["last_reasons"] = set()
+                    pose_state["fire_cooldown_until"] = 0.0
 
                 if pose_state["stable_slouching"]:
                     if not pose_state["steady_bad_announced"]:
@@ -866,14 +871,43 @@ def pose_worker():
                         print("[POSTURE] GOOD")
                     pose_state["steady_bad_announced"] = False
 
+        # Platform aim only in sustained bad posture ("aiming mode"); otherwise idle the turntable.
         if posture_tracking_enabled.is_set():
-            if results.pose_landmarks:
+            with pose_lock:
+                stable_bad = pose_state["stable_slouching"]
+                fire_cooldown_until = pose_state["fire_cooldown_until"]
+            should_aim = bool(results.pose_landmarks and stable_bad)
+            if should_aim:
                 _lm = results.pose_landmarks.landmark
                 _mid_x = (_lm[plm.LEFT_SHOULDER].x + _lm[plm.RIGHT_SHOULDER].x) * 0.5
                 _error_px = int((_mid_x - 0.5) * FRAME_WIDTH)
-                send_command(f"P,{_error_px}")
+                
+                now = time.time()
+                # Only send P commands if not in cooldown
+                if now < fire_cooldown_until:
+                    # During cooldown, don't move platform
+                    pass
+                else:
+                    # Send fixed-speed commands: P -20 or P 20
+                    if _error_px < 0:
+                        send_command("P,-20")
+                    elif _error_px > 0:
+                        send_command("P,20")
+                    else:
+                        send_command("stop")
+                    
+                    # Fire when centered (within deadband) and cooldown expired
+                    if abs(_error_px) <= AIM_DEADBAND_PX:
+                        send_command("fire")
+                        with pose_lock:
+                            pose_state["fire_cooldown_until"] = now + (FLYWHEEL_CYCLE_TIME_MS / 1000.0)
+                        print("[FIRING] Centered and firing!")
             else:
-                send_command("stop")
+                if not results.pose_landmarks:
+                    send_command("stop")
+                elif getattr(pose_worker, "_prev_should_aim", False):
+                    send_command("stop")
+            pose_worker._prev_should_aim = should_aim
 
         time.sleep(0.09)
 
@@ -974,25 +1008,23 @@ time.sleep(0.3)
 
 if ser:
     threading.Thread(target=_serial_reader_thread, daemon=True).start()
-    send_command("on")
-    time.sleep(0.15)
-    send_command("stop")
-    time.sleep(0.05)
     send_command("h")
-    print("[CONTROL] Sent on, stop, h — finish homing in this terminal.")
+    print("[CONTROL] Entering homing mode. Jog the platform and type 'home' in the Pico terminal to center it.")
+else:
+    print("[SERIAL] No Pico detected — posture tracking disabled.")
 
 try:
     while True:
         time.sleep(0.25)
 except KeyboardInterrupt:
-    print("\n[INFO] Stopped.")
+    print("\n[INFO] Stopped (Ctrl+C).")
 finally:
     pose_stop.set()
     camera_shutdown.set()
     if ser:
         try:
             send_command("stop")
-            time.sleep(0.05)
+            time.sleep(0.08)
             send_command("off")
         except Exception:
             pass
