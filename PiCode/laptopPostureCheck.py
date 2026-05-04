@@ -45,7 +45,7 @@ PERSON_LOST_STREAK = 4
 BAD_HOLD_SECONDS = 3.0
 STREAM_PORT = int(os.environ.get("STREAM_PORT", "8765" if IS_WINDOWS else "5000"))
 STREAM_FPS = 4
-STREAM_JPEG_QUALITY = 35
+STREAM_JPEG_QUALITY = 30
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "1" if IS_WINDOWS else "0"))
 
 amUsingUltrasonicSensor = 0  # 1 = use Pico ultrasonic lines for banner/range; 0 = not wired
@@ -254,7 +254,7 @@ def open_camera():
     if IS_LINUX and _has_csi_camera():
         try:
             print("[CAMERA] CSI Pi Camera detected — using rpicam-vid (MJPEG)")
-            pi = PiCamMJPEG(FRAME_WIDTH, FRAME_HEIGHT, fps=6)
+            pi = PiCamMJPEG(FRAME_WIDTH, FRAME_HEIGHT, fps=4)
             warmup_deadline = time.time() + 15.0
             best = 0.0
             last_frame = None
@@ -315,8 +315,7 @@ def open_camera():
                 cap_try.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
                 pass
-            cap_try.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-            cap_try.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
             cap_try.set(cv2.CAP_PROP_FPS, 15)
 
             for _ in range(25):
@@ -415,14 +414,6 @@ def start_stream():
                     + payload + b"\r\n"
                 )
             time.sleep(frame_period)
-
-    @app.route("/stream")
-    def stream():
-        return Response(
-            mjpeg_generator(),
-            mimetype="multipart/x-mixed-replace; boundary=frame",
-            headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"},
-        )
 
     @app.route("/")
     def index():
@@ -817,6 +808,11 @@ def pose_worker():
             time.sleep(0.05)
             continue
         with pose_lock:
+            in_cooldown = time.time() < pose_state["fire_cooldown_until"]
+        if in_cooldown:
+            time.sleep(0.5)
+            continue
+        with pose_lock:
             if pose_raw_frame is None or pose_raw_id == pose_state["_last_id"]:
                 frame = None
             else:
@@ -827,7 +823,7 @@ def pose_worker():
             continue
 
         h, w = frame.shape[:2]
-        small = cv2.resize(frame, (128, int(128 * h / w))) if w > 128 else frame
+        small = cv2.resize(frame, (96, int(96 * h / w))) if w > 96 else frame
         rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         results = pose.process(rgb_frame)
         now = time.time()
@@ -902,6 +898,7 @@ def pose_worker():
                         with pose_lock:
                             pose_state["fire_cooldown_until"] = now + (FLYWHEEL_CYCLE_TIME_MS / 1000.0)
                         print("[FIRING] Centered and firing!")
+                        time.sleep(0.5)
             else:
                 if not results.pose_landmarks:
                     send_command("stop")
@@ -909,7 +906,9 @@ def pose_worker():
                     send_command("stop")
             pose_worker._prev_should_aim = should_aim
 
-        time.sleep(0.09)
+        with pose_lock:
+            in_cooldown = time.time() < pose_state["fire_cooldown_until"]
+        time.sleep(0.3 if in_cooldown else 0.15)
 
 threading.Thread(target=pose_worker, daemon=True).start()
 
@@ -925,6 +924,9 @@ def _camera_capture_loop():
         if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
             frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
+        # Flip upside down AND horizontally
+        frame = cv2.flip(frame, -1)
+        
         with pose_lock:
             pose_raw_frame = frame
             pose_raw_id += 1
@@ -940,6 +942,7 @@ def _camera_capture_loop():
 
         display_frame = frame.copy()
         tracking = posture_tracking_enabled.is_set()
+        in_cooldown = time.time() < pose_state["fire_cooldown_until"]
 
         if not tracking:
             cv2.putText(
@@ -951,6 +954,16 @@ def _camera_capture_loop():
                 (0, 255, 255),
                 2,
                 cv2.LINE_AA,
+            )
+        elif in_cooldown:
+            cv2.putText(
+                display_frame,
+                "LAUNCHED",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 140, 255),
+                2,
             )
         elif cached_landmarks is not None:
             overlay_reasons = last_reasons if stable_slouching else set()
@@ -1000,6 +1013,9 @@ def _camera_capture_loop():
             )
 
         latest_frame = display_frame
+        with pose_lock:
+            in_cooldown = time.time() < pose_state["fire_cooldown_until"]
+        time.sleep(0.5 if in_cooldown else 0.1)
 
 
 cam_thread = threading.Thread(target=_camera_capture_loop, daemon=True)
