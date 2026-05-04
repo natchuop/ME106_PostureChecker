@@ -880,9 +880,9 @@ def pose_worker():
                 else:
                     # Send fixed-speed commands: P -20 or P 20
                     if _error_px < 0:
-                        send_command("P,-20")
+                        send_command("P,+20")
                     elif _error_px > 0:
-                        send_command("P,20")
+                        send_command("P,-20")
                     else:
                         send_command("stop")
                     
@@ -1018,8 +1018,13 @@ time.sleep(0.3)
 
 if ser:
     threading.Thread(target=_serial_reader_thread, daemon=True).start()
+
     send_command("h")
     print("[CONTROL] Entering homing mode. Jog the platform and type 'home' in the Pico terminal to center it.")
+
+    time.sleep(0.2)
+    send_command("on")
+    print("[CONTROL] Sent 'on' after homing start.")
 else:
     print("[SERIAL] No Pico detected — posture tracking disabled.")
 
