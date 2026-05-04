@@ -7,11 +7,13 @@ to the Pico running main.py instead of controlling hardware directly.
 Commands (type and press Enter):
   on          — activate the Pico (starts motor loop)
   off         — deactivate the Pico
-  P <int>     — rotate platform (e.g. "P 100", "P -50")
+  h           — enter blocking platform homing on the Pico (then use Pico USB for +/−/home)
   F           — fire flywheel
-  stop        — stop platform rotation
+  stop        — stop platform motor
   U           — read ultrasonic sensor once
   q / quit    — exit this script
+
+After h, jog degrees on the Pico’s own USB serial; main.py does not accept move: or pixel commands.
 """
 
 import os
@@ -99,7 +101,7 @@ def send(cmd: str):
 # ── Main REPL ─────────────────────────────────────────────────────────────────
 
 print()
-print("Commands: on, off, P <int>, F, stop, U, q")
+print("Commands: on, off, h, F, stop, U, q")
 print("Waiting for Pico startup message...")
 print()
 
@@ -122,22 +124,14 @@ while True:
         send("on")
     elif raw == "off":
         send("off")
+    elif raw == "h":
+        send("h")
     elif raw == "stop":
         send("stop")
     elif upper == "F":
         send("fire")
     elif upper == "U":
         send("ultrasonic")
-    elif upper.startswith("P "):
-        parts = raw.split()
-        if len(parts) == 2:
-            try:
-                val = int(parts[1])
-                send(f"move:{val}")
-            except ValueError:
-                print("Use: P <int>  (e.g. P 100 or P -50)")
-        else:
-            print("Use: P <int>  (e.g. P 100 or P -50)")
     else:
         print(f"Unknown command: {raw!r}")
-        print("Commands: on, off, P <int>, F, stop, U, q")
+        print("Commands: on, off, h, F, stop, U, q")

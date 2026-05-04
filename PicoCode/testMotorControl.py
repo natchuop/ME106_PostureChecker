@@ -5,8 +5,7 @@ import uselect
 import MotorControlFunctions as mcf
 
 
-def _read_command_nonblocking(poller):
-    """Return one command line if available, otherwise None."""
+def _read_line(poller):
     if poller.poll(0):
         line = sys.stdin.readline()
         if line:
@@ -18,76 +17,76 @@ def main():
     print("Initializing motors...")
     mcf.initializeFlywheel()
     mcf.initializePlatformMotor()
+    mcf.setPlatformHomeHere()
     mcf.initializeCrankServo()
     mcf.initializeUltrasonic()
-    print("Ready.")
-    print("Commands: P <int>, F, C <deg>, U")
+    print("Ready. Commands: P <px>, H, F, C <deg>, U, stop")
 
     poller = uselect.poll()
     poller.register(sys.stdin, uselect.POLLIN)
-
-    last_platform_distance = 0
+    spinning_error_px = None
 
     while True:
-        # Keep platform continuously updated with latest distance command.
-        mcf.rotatePlatform(last_platform_distance)
+        cmd = _read_line(poller)
 
-        cmd = _read_command_nonblocking(poller)
-        if cmd is not None:
-            if not cmd:
-                pass
-            elif cmd.startswith("P "):
-                parts = cmd.split()
-                if len(parts) == 2:
-                    try:
-                        last_platform_distance = int(parts[1])
-                        print("Platform distance set to:", last_platform_distance)
-                    except ValueError:
-                        print("Invalid P command. Use: P <int>")
-                else:
-                    print("Invalid P command. Use: P <int>")
-            elif cmd.startswith("C "):
-                parts = cmd.split()
-                if len(parts) == 2:
-                    try:
-                        deg = int(parts[1])
-                        mcf.moveCrankServo(deg)
-                        print("Crank servo moved to:", deg, "deg")
-                    except ValueError:
-                        print("Invalid C command. Use: C <deg>")
-                else:
-                    print("Invalid C command. Use: C <deg>")
+        if cmd:
+            if cmd.startswith("P ") and len(cmd.split()) == 2:
+                try:
+                    spinning_error_px = int(cmd.split()[1])
+                    print("Spin error_px:", spinning_error_px, "| angle:", round(mcf.getPlatformAngleDeg(), 2), "deg")
+                except ValueError:
+                    print("Invalid P. Use: P <signed_pixels>")
+            elif cmd == "stop":
+                spinning_error_px = None
+                mcf.stopPlatformMotor()
+                print("Stopped. angle:", round(mcf.getPlatformAngleDeg(), 2), "deg")
+            elif cmd.startswith("C ") and len(cmd.split()) == 2:
+                try:
+                    deg = int(cmd.split()[1])
+                    mcf.moveCrankServo(deg)
+                    print("Crank servo:", deg, "deg")
+                except ValueError:
+                    print("Invalid C. Use: C <deg>")
             elif cmd == "F":
-                print("Running flywheel sequence...")
-                flywheel_started = False
+                spinning_error_px = None
+                print("Flywheel sequence...")
+                started = False
                 while True:
                     mcf.tryFlywheel()
                     if mcf.flywheel_active:
-                        flywheel_started = True
-                    elif flywheel_started:
-                        break  # one full cycle complete, do not restart
+                        started = True
+                    elif started:
+                        break
                     time.sleep_ms(10)
-                print("Flywheel sequence complete.")
+                print("Flywheel done.")
             elif cmd == "U":
-                print("Ultrasonic readout: 5x/sec for 5 seconds...")
                 for i in range(25):
-                    distance_ft = mcf.readUltrasonic()
-                    if distance_ft == -1:
-                        print("U", i + 1, ":", -1)
-                    else:
-                        print("U", i + 1, ":", round(distance_ft, 3), "ft")
+                    d = mcf.readUltrasonic()
+                    print("U", i + 1, ":", -1 if d == -1 else round(d, 3), "ft")
                     time.sleep_ms(200)
-                print("Ultrasonic readout complete.")
+            elif cmd.upper() == "H":
+                spinning_error_px = None
+                mcf.stopPlatformMotor()
+                print("Homing (blocking)...")
+                mcf.homePlatformMotor()
+                print("Homing done.")
             else:
-                print("Unknown command:", cmd)
+                print("Unknown:", cmd)
 
-            # Clear command so it does not repeat.
-            cmd = None
+        if spinning_error_px is not None and mcf.rotatePlatformMotor(spinning_error_px):
+            spinning_error_px = None
+            print("Aim stopped (limit or stall). angle:", round(mcf.getPlatformAngleDeg(), 2), "deg")
 
-        # Keep flywheel state machine advancing without blocking.
-        #mcf.tryFlywheel()
         time.sleep_ms(10)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            mcf.stopPlatformMotor()
+        except Exception:
+            pass

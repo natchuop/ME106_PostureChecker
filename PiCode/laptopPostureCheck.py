@@ -1,25 +1,5 @@
-"""
-laptopPostureCheck.py — Posture monitor for Windows + Raspberry Pi OS (Linux)
-
-Same codebase runs on both:
-  • Windows laptop (dev/testing) — integrated or USB webcam (via V4L2/MSMF).
-  • Raspberry Pi Zero 2 W (deployment) — CSI Pi Camera via rpicam-vid, or
-    USB webcam on /dev/video0.
-Both platforms host the annotated live stream over HTTP (multipart MJPEG).
-MediaPipe pose runs on a background thread so the stream isn't gated by it.
-
-INSTALL (Windows):
-    pip install mediapipe opencv-python-headless pyserial flask
-
-INSTALL (Pi OS Bookworm/Trixie, 64-bit, Python 3.11/3.12 venv):
-    sudo apt install -y rpicam-apps libopenblas-dev libgl1
-    pip install mediapipe opencv-python-headless pyserial flask
-
-ACCESS STREAM (point browser at the host running this script):
-    Pi:      http://<pi-ip>:5000/
-    Windows: http://127.0.0.1:8765/   (port 5000 collides with AirPlay etc.)
-Env overrides: STREAM_PORT, CAMERA_INDEX, SERIAL_PORT.
-"""
+"""Posture cam + MJPEG stream (Windows or Pi). pip: mediapipe opencv-python-headless pyserial flask.
+Pi CSI: apt install rpicam-apps libopenblas-dev libgl1. Stream: http://<host>:STREAM_PORT/ (8765 Windows default)."""
 
 import cv2
 import numpy as np
@@ -33,15 +13,9 @@ import threading
 import shutil
 import subprocess
 
-# ─────────────────────────────────────────────
-# PLATFORM + MEDIAPIPE
-# ─────────────────────────────────────────────
-
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 
-# TFLite / XNNPACK threads = 2 on the Pi: try to parallelize inference across
-# two cores while keeping two cores cold for thermal headroom.
 if IS_LINUX:
     os.environ.setdefault("OMP_NUM_THREADS", "2")
     os.environ.setdefault("TFLITE_NUM_THREADS", "2")
@@ -58,12 +32,8 @@ except Exception as e:
     print("Run: pip install mediapipe  (Pi OS: pip install --break-system-packages mediapipe)")
     sys.exit(1)
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-
 SERIAL_PORT = os.environ.get(
-    "SERIAL_PORT", "COM10" if IS_WINDOWS else "/dev/ttyACM0"
+    "SERIAL_PORT", "COM7" if IS_WINDOWS else "/dev/ttyACM0"
 )
 BAUD_RATE = 9600
 SERIAL_CONNECT_RETRIES = int(os.environ.get("SERIAL_CONNECT_RETRIES", "20"))
@@ -71,45 +41,27 @@ SERIAL_RETRY_DELAY_S = float(os.environ.get("SERIAL_RETRY_DELAY_S", "0.6"))
 
 FRAME_WIDTH = 256
 FRAME_HEIGHT = 192
-CENTER_DEADZONE = 5
-# Drop "person lost" only after this many misses (brief occlusions recover).
 PERSON_LOST_STREAK = 4
-# Confirm bad posture only after holding it for this long (seconds).
 BAD_HOLD_SECONDS = 3.0
-# Windows port 5000 often collides with AirPlay / other services; Pi is free to use 5000.
 STREAM_PORT = int(os.environ.get("STREAM_PORT", "8765" if IS_WINDOWS else "5000"))
-STREAM_FPS = 4           # target frames/sec pushed to browser
-STREAM_JPEG_QUALITY = 35 # 0-100; lower = less bandwidth, more artifacting
-FIRE_COOLDOWN_SECONDS = 8.0
-
-# Webcam index (USB / integrated only — CSI Pi Camera auto-detected separately).
+STREAM_FPS = 4
+STREAM_JPEG_QUALITY = 35
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "1" if IS_WINDOWS else "0"))
 
-# Posture thresholds. Normalized landmarks (0..1, y grows downward) unless noted _DEG.
-# Webcam is mostly frontal; 2D proxies stand in for true sagittal measurements.
-# Side/torso cues (spine_angle + torso_lean only fire when hips are visible).
-SPINE_ANGLE_MIN_DEG = 156.0            # nose-mid_shoulder-mid_hip; primary spine/torso check
-SHOULDER_HIP_HORIZONTAL_MAX = 0.052    # mid_shoulder.x vs mid_hip.x; forward-lean proxy
-# Head / neck cues (work without hips)
-FOREHEAD_SHOULDER_CLEARANCE_MIN = 0.118 # face top too close to shoulders (FHP proxy)
-TRAP_NECK_CLEARANCE_MIN = 0.058        # ears too close vertically to shoulders (raised shoulders)
-CHIN_BELOW_EAR_Y = 0.045               # chin dropped below ear line
-HEAD_OFF_CENTER_X_MAX = 0.068          # |nose.x − mid_shoulder.x|; head shifted off center
-# Symmetry cues (angle-based, distance independent)
-SHOULDER_SLOPE_MAX_DEG = 5.5           # shoulder line tilt vs horizontal
-EAR_SLOPE_MAX_DEG = 6.5                # ear line tilt vs horizontal (head tilt)
-# Visibility gates
+amUsingUltrasonicSensor = True
+
+SPINE_ANGLE_MIN_DEG = 156.0
+SHOULDER_HIP_HORIZONTAL_MAX = 0.052
+FOREHEAD_SHOULDER_CLEARANCE_MIN = 0.118
+TRAP_NECK_CLEARANCE_MIN = 0.058
+CHIN_BELOW_EAR_Y = 0.045
+HEAD_OFF_CENTER_X_MAX = 0.068
+SHOULDER_SLOPE_MAX_DEG = 5.5
+EAR_SLOPE_MAX_DEG = 6.5
 HIP_MIN_VISIBILITY = 0.35
 NOSE_MIN_VISIBILITY = 0.2
 EAR_MIN_VISIBILITY = 0.22
 FOREHEAD_VIS_MIN = 0.18
-
-# ─────────────────────────────────────────────
-# SERIAL SETUP
-# ─────────────────────────────────────────────
-# All reads/writes must go through `serial_lock`. Overlapping readline (reader
-# thread) and write (pose / stdin) on the same Windows COM port often triggers
-# WriteFile / PermissionError: "The device does not recognize the command."
 
 ser = None
 serial_lock = threading.Lock()
@@ -128,18 +80,16 @@ def _open_serial_once():
 
 
 def _boot_pico_main():
-    # If the Pico is in *raw* REPL, Ctrl+D does not soft-reboot. Always exit
-    # raw first, then interrupt, then soft reset so main.py runs.
     with serial_lock:
         ser.reset_input_buffer()
-        ser.write(b"\x02")  # Ctrl+B — normal REPL
+        ser.write(b"\x02")
     time.sleep(0.2)
     with serial_lock:
-        ser.write(b"\x03")  # Ctrl+C
+        ser.write(b"\x03")
     time.sleep(0.4)
     with serial_lock:
-        ser.write(b"\x04")  # Ctrl+D — soft reboot
-    time.sleep(3.0)  # main.py + hardware init
+        ser.write(b"\x04")
+    time.sleep(3.0)
 
 
 for attempt in range(1, SERIAL_CONNECT_RETRIES + 1):
@@ -164,32 +114,22 @@ for attempt in range(1, SERIAL_CONNECT_RETRIES + 1):
         else:
             print(
                 f"[SERIAL] No Pico on {SERIAL_PORT} after {SERIAL_CONNECT_RETRIES} attempts "
-                f"({e}). Continuing without motor/fire commands."
+                f"({e}). Continuing without motor commands."
             )
 
-# ─────────────────────────────────────────────
-# CAMERA SETUP
-# ─────────────────────────────────────────────
+posture_tracking_enabled = threading.Event()
+if not ser:
+    posture_tracking_enabled.set()
+
 
 def _frame_brightness(frame):
-    """Mean pixel level; ~0 = black (wrong/disabled device), higher = real picture."""
     if frame is None or frame.size == 0:
         return 0.0
     return float(np.mean(frame))
 
 
 class PiCamMJPEG:
-    """
-    cv2.VideoCapture-compatible wrapper around `rpicam-vid` for the Pi CSI
-    camera (libcamera stack on Pi OS Bookworm/Trixie). Spawns rpicam-vid as a
-    subprocess streaming MJPEG to stdout; a background reader thread drains
-    the pipe continuously and keeps only the most recent decoded BGR frame,
-    so read() always returns a near-real-time frame even when the main loop
-    (e.g. MediaPipe) runs slower than the camera's output rate.
-
-    Only the subset of the VideoCapture API this script uses is implemented:
-    read(), release(), isOpened().
-    """
+    """CSI camera via rpicam-vid MJPEG pipe; read() / release() / isOpened() only."""
 
     _SOI = b"\xff\xd8"
     _EOI = b"\xff\xd9"
@@ -219,7 +159,6 @@ class PiCamMJPEG:
         self._reader.start()
 
     def _reader_loop(self):
-        """Continuously parse MJPEG stream and overwrite self._latest."""
         buf = bytearray()
         read = self._proc.stdout.read
         while self._opened:
@@ -258,11 +197,6 @@ class PiCamMJPEG:
         return True
 
     def read(self):
-        """
-        Return (ret, frame_bgr) with the latest available frame.
-        Waits up to 2s for a *new* frame (one we haven't returned before) to
-        keep timestamps monotonic; if none arrives, returns the cached one.
-        """
         with self._cond:
             if not self._cond.wait_for(
                 lambda: self._frame_id > self._last_seen_id or self._latest is not None,
@@ -285,7 +219,6 @@ class PiCamMJPEG:
 
 
 def _has_csi_camera():
-    """Best-effort check: is a libcamera-visible camera attached?"""
     if shutil.which("rpicam-vid") is None and shutil.which("libcamera-vid") is None:
         print("[CAMERA] rpicam-vid / libcamera-vid not found — install with: sudo apt install rpicam-apps")
         return False
@@ -304,7 +237,6 @@ def _has_csi_camera():
             return False
         if res.returncode != 0 and "available cameras" not in combined:
             return False
-        # Pull just the "0 : sensor_name ..." line for a concise summary.
         summary = next(
             (ln.strip() for ln in res.stdout.splitlines() if ln.strip().startswith("0 :")),
             "camera present",
@@ -317,19 +249,11 @@ def _has_csi_camera():
 
 
 def open_camera():
-    """
-    Find a capture device that actually delivers non-black frames.
-    On Windows, try Media Foundation before DirectShow — DSHOW often opens a
-    phantom/virtual device that reads OK but is all black.
-    On Linux, if a CSI Pi Camera is detected, stream via rpicam-vid (MJPEG).
-    """
+    """Open a non-black capture device (CSI via rpicam on Pi; MSMF/DSHOW on Windows)."""
     if IS_LINUX and _has_csi_camera():
         try:
             print("[CAMERA] CSI Pi Camera detected — using rpicam-vid (MJPEG)")
             pi = PiCamMJPEG(FRAME_WIDTH, FRAME_HEIGHT, fps=6)
-            # rpicam-vid cold start can take 3-6s (libcamera init + AGC/AEC
-            # convergence). Be patient: poll up to 15s for a usable frame, with
-            # a progress dot every second so the user sees it working.
             warmup_deadline = time.time() + 15.0
             best = 0.0
             last_frame = None
@@ -366,13 +290,11 @@ def open_camera():
         indices = list(range(6))
 
     if IS_WINDOWS:
-        # MSMF first: often the real integrated webcam; DSHOW second for compatibility
         backends = [
             (cv2.CAP_MSMF, "Media Foundation"),
             (cv2.CAP_DSHOW, "DirectShow"),
         ]
     elif IS_LINUX:
-        # V4L2 is the right backend for USB webcams on Raspberry Pi OS / Linux.
         backends = [
             (cv2.CAP_V4L2, "V4L2"),
             (None, "default"),
@@ -380,7 +302,6 @@ def open_camera():
     else:
         backends = [(None, "default")]
 
-    # Reject feeds that look like a dead/blank device (not the same as a dark room)
     min_brightness = 6.0
 
     for idx in indices:
@@ -446,10 +367,6 @@ if cap is None:
         print("    (install with: sudo apt install rpicam-apps)")
     sys.exit(1)
 
-# ─────────────────────────────────────────────
-# MEDIAPIPE POSE SETUP
-# ─────────────────────────────────────────────
-
 pose = mp_pose.Pose(
     model_complexity=0,
     smooth_landmarks=False,
@@ -457,16 +374,11 @@ pose = mp_pose.Pose(
     min_tracking_confidence=0.5,
 )
 
-# ─────────────────────────────────────────────
-# STREAMING (unified Flask multipart MJPEG, works on Windows + Pi)
-# ─────────────────────────────────────────────
-
 latest_frame = None
 
 
 def _discover_lan_ip():
-    """Find an outbound-facing IP without actually sending. Robust to /etc/hosts loopback
-    aliases (Raspberry Pi OS maps the hostname to 127.0.1.1 by default)."""
+    """Best-effort LAN IP for stream URL (UDP trick)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -478,13 +390,9 @@ def _discover_lan_ip():
 
 
 def start_stream():
-    """HTTP server that serves an MJPEG stream with the posture overlay baked in.
-    Single long-lived connection per viewer (multipart/x-mixed-replace) — efficient
-    enough for a Pi Zero 2 W and for a laptop alike."""
     from flask import Flask, Response
 
     app = Flask(__name__)
-    # Silence the noisy per-request access log (Pi Zero benefits from less I/O too).
     import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
@@ -547,57 +455,58 @@ def start_stream():
         daemon=True,
     )
     thread.start()
-    time.sleep(0.2)  # let the socket bind before the main loop starts producing frames
+    time.sleep(0.2)
 
 
 start_stream()
 
-# ─────────────────────────────────────────────
-# SERIAL HELPERS
-# ─────────────────────────────────────────────
+
+def _serial_always_send_raw(cmd: str) -> bool:
+    c = (cmd or "").strip().lower()
+    if c in ("home", "h", "on", "off", "stop", "ultrasonic"):
+        return True
+    if c.startswith("p,"):
+        return True
+    try:
+        float(c)
+        return True
+    except ValueError:
+        return False
+
 
 def send_command(cmd):
-    if ser:
-        try:
-            # Coalesce high-rate aim commands so USB-CDC TX is not flooded.
-            now = time.time()
-            if not hasattr(send_command, "_last_move_value"):
-                send_command._last_move_value = None
-                send_command._last_move_time = 0.0
-                send_command._last_other_cmd = None
-                send_command._last_other_time = 0.0
+    if not ser:
+        if not getattr(send_command, "_warned_none", False):
+            print("[SERIAL] No Pico serial — commands are not sent. Set SERIAL_PORT or connect USB.")
+            send_command._warned_none = True
+        return
+    try:
+        now = time.time()
+        if not hasattr(send_command, "_last_other_cmd"):
+            send_command._last_other_cmd = None
+            send_command._last_other_time = 0.0
 
-            if cmd.startswith("move:"):
-                try:
-                    move_value = int(float(cmd.split(":", 1)[1]))
-                except Exception:
-                    move_value = None
-                if move_value is not None:
-                    last_move = send_command._last_move_value
-                    dt = now - send_command._last_move_time
-                    # Drop tiny/high-frequency move updates; Pico only needs fresh snapshots.
-                    if last_move is not None and abs(move_value - last_move) < 4 and dt < 0.06:
-                        return
-                    send_command._last_move_value = move_value
-                    send_command._last_move_time = now
-            else:
-                # Suppress accidental duplicate non-move commands in short bursts.
-                if cmd == send_command._last_other_cmd and (now - send_command._last_other_time) < 0.15:
-                    return
-                send_command._last_other_cmd = cmd
-                send_command._last_other_time = now
+        if not _serial_always_send_raw(cmd):
+            if cmd == send_command._last_other_cmd and (now - send_command._last_other_time) < 0.15:
+                return
+            send_command._last_other_cmd = cmd
+            send_command._last_other_time = now
+        else:
+            send_command._last_other_cmd = cmd
+            send_command._last_other_time = now
 
-            data = f"{cmd}\n".encode()
-            with serial_lock:
-                ser.write(data)
-        except Exception as e:
-            print(f"[SERIAL] Error: {e}")
+        data = f"{cmd}\n".encode()
+        with serial_lock:
+            ser.write(data)
+            try:
+                ser.flush()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[SERIAL] Error: {e}")
+
 
 def _serial_reader_thread():
-    """Forward any lines the Pico prints over USB serial to the laptop terminal.
-    Drains in short reads under the lock (no long readline) so writes are not
-    starved and other threads are not blocked behind serial I/O.
-    """
     buf = b""
     while True:
         if not ser:
@@ -613,46 +522,34 @@ def _serial_reader_thread():
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
                     print(f"[PICO] {text}")
+                    low = text.lower()
+                    if "entering home mode" in low:
+                        posture_tracking_enabled.clear()
+                        print("[HOMING] Posture tracking paused — camera still live.")
+                        with pose_lock:
+                            pose_state["cached_landmarks"] = None
+                            pose_state["stable_slouching"] = False
+                            pose_state["bad_since"] = None
+                            pose_state["last_reasons"] = set()
+                            pose_state["person_lost_streak"] = 0
+                    elif "home complete" in low or "home set:" in low:
+                        posture_tracking_enabled.set()
+                        print("[HOMING] Posture tracking enabled.")
+                    elif amUsingUltrasonicSensor and text == "USONIC_WEB:out_of_range":
+                        with pose_lock:
+                            pose_state["ultrasonic_banner"] = "TARGET OUT OF RANGE"
+                    elif amUsingUltrasonicSensor and text == "USONIC_WEB:in_range":
+                        with pose_lock:
+                            pose_state["ultrasonic_banner"] = None
         except Exception:
             pass
         time.sleep(0.01)
 
-if ser:
-    threading.Thread(target=_serial_reader_thread, daemon=True).start()
-    send_command("off")   # ensure Pico starts in off state
-    print("[CONTROL] Pico defaulting to OFF — type 'on' to activate")
-
-def rotate_left(error):
-    send_command(f"move:{error}")
-
-def rotate_right(error):
-    send_command(f"move:{error}")
-
-def stop_motor():
-    send_command("stop")
-
-def fire():
-    global next_fire_ready_at
-    print("[FIRE] Firing — cooldown ~8 seconds")
-    send_command("fire")
-    next_fire_ready_at = time.time() + FIRE_COOLDOWN_SECONDS
-    threading.Timer(
-        FIRE_COOLDOWN_SECONDS,
-        lambda: print("[FIRE] Cooldown complete — ready to fire again"),
-    ).start()
-
-# ─────────────────────────────────────────────
-# POSTURE (sagittal spine curvature + head / neck)
-# ─────────────────────────────────────────────
 
 plm = mp_pose.PoseLandmark
 
 
 def spine_angle_deg(lm):
-    """
-    Angle at mid-shoulder between vectors to nose and to mid_hip (sagittal spine bend).
-    ~180° = straighter; lower = more forward curvature / slouch.
-    """
     nose = lm[plm.NOSE]
     ls, rs = lm[plm.LEFT_SHOULDER], lm[plm.RIGHT_SHOULDER]
     lh, rh = lm[plm.LEFT_HIP], lm[plm.RIGHT_HIP]
@@ -671,10 +568,6 @@ def spine_angle_deg(lm):
 
 
 def _face_top_y(lm):
-    """
-    Smallest y among visible nose + eye points = highest part of face in the image
-    (proxy for forehead / upper face). Dips toward shoulders when slouching.
-    """
     ys = []
     for i in range(7):
         p = lm[i]
@@ -689,7 +582,6 @@ def _face_top_y(lm):
 
 
 def _line_slope_deg(ax, ay, bx, by):
-    """Tilt of segment A-B vs horizontal, in degrees, always non-negative."""
     dx = abs(bx - ax)
     dy = abs(by - ay)
     if dx < 1e-6:
@@ -698,17 +590,7 @@ def _line_slope_deg(ax, ay, bx, by):
 
 
 def evaluate_posture(landmarks):
-    """
-    Returns (is_bad, reasons). Two buckets:
-      Side/torso cues (any one alone => bad):
-        - spine_angle: nose-mid_shoulder-mid_hip angle < SPINE_ANGLE_MIN_DEG (hips only)
-        - forehead_dip: face top too close to shoulders (FHP, no hips needed)
-        - trap_neck:    ears too close vertically to shoulders (raised/hunched)
-        - chin_down:    chin below ear line
-        - torso_lean:   mid_shoulder horizontally offset from mid_hip (hips only)
-      Front cues (shoulder_slope alone OR 2+ signals => bad):
-        - shoulder_slope (angle), ear_slope (angle), head_offcenter
-    """
+    """Return (is_bad, reasons). Strong side/torso cues alone => bad; else front cues (slope/tilt/off-center)."""
     lm = landmarks.landmark
     nose = lm[plm.NOSE]
     ls, rs = lm[plm.LEFT_SHOULDER], lm[plm.RIGHT_SHOULDER]
@@ -729,7 +611,6 @@ def evaluate_posture(landmarks):
 
     reasons = set()
 
-    # --- Side/torso cues ---
     if hips_visible and nose_vis >= NOSE_MIN_VISIBILITY:
         ang = spine_angle_deg(lm)
         if ang is not None and ang < SPINE_ANGLE_MIN_DEG:
@@ -753,7 +634,6 @@ def evaluate_posture(landmarks):
     if reasons & strong_side:
         return True, reasons
 
-    # --- Front cues (angle-based; distance independent) ---
     shoulder_slope = _line_slope_deg(ls.x, ls.y, rs.x, rs.y)
     ear_slope = _line_slope_deg(lea.x, lea.y, rea.x, rea.y) if ears_ok else None
     shoulder_bad = shoulder_slope > SHOULDER_SLOPE_MAX_DEG
@@ -784,7 +664,6 @@ def _pt_xy(lm, idx, w, h):
 
 
 def _draw_dense_on_connections(frame, lm, w, h, connections, steps=5, color=(160, 160, 220), r=2):
-    """Extra sample nodes along given segments only."""
     for a, b in connections:
         pa = _pt_xy(lm, a, w, h)
         pb = _pt_xy(lm, b, w, h)
@@ -799,7 +678,6 @@ def _draw_dense_px(frame, pa, pb, steps=6, color=(120, 220, 200), r=2):
         cv2.circle(frame, _lerp(pa, pb, t), r, color, -1)
 
 
-# Upper body only: no legs. Head/neck: nose + ears drawn separately.
 TORSO_CONNECTIONS = (
     (plm.LEFT_SHOULDER, plm.RIGHT_SHOULDER),
     (plm.LEFT_SHOULDER, plm.LEFT_HIP),
@@ -815,7 +693,6 @@ TORSO_JOINT_INDICES = (
 
 
 def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
-    """Bones + neck (nose→shoulders) + spine (mid-shoulder→mid-hip); optional ear→mid-shoulder neck base."""
     if reasons is None:
         reasons = set()
     lm = landmarks.landmark
@@ -881,16 +758,12 @@ def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
 
     cv2.circle(frame, nose_pt, 6, head_bgr, 2)
 
-    # spine_angle_deg() / _line_slope_deg() still available for evaluate_posture()
-    # and any other consumers — we just no longer print them on the stream.
-
     _draw_dense_on_connections(frame, lm, w, h, TORSO_CONNECTIONS, steps=4)
 
     for idx in TORSO_JOINT_INDICES:
         p = lm[idx]
         if getattr(p, "visibility", 1.0) < 0.2:
             continue
-        # Color important joints based on which check failed.
         if idx in (plm.LEFT_SHOULDER, plm.RIGHT_SHOULDER) and slouching and "shoulder_slope" in reasons:
             c = (0, 0, 255)
         elif idx in (plm.LEFT_HIP, plm.RIGHT_HIP) and slouching and "torso_lean" in reasons:
@@ -899,90 +772,46 @@ def draw_posture_overlay(frame, landmarks, slouching, reasons=None):
             c = node_bgr
         cv2.circle(frame, _pt_xy(lm, idx, w, h), 5, c, 2)
 
-# ─────────────────────────────────────────────
-# AIMING
-# ─────────────────────────────────────────────
-
-def get_person_center_x(landmarks, w):
-    lm = landmarks.landmark
-    center_x_norm = (lm[plm.LEFT_SHOULDER].x + lm[plm.RIGHT_SHOULDER].x) * 0.5
-    return int(center_x_norm * w)
-
-fired = False
-next_fire_ready_at = 0.0
-
-def handle_aiming(landmarks, w):
-    global fired
-    frame_center = w // 2
-    person_x = get_person_center_x(landmarks, w)
-    error = person_x - frame_center
-    now = time.time()
-
-    # Re-arm automatically when cooldown ends, even if posture remains BAD.
-    if fired and now >= next_fire_ready_at:
-        fired = False
-
-    if abs(error) <= CENTER_DEADZONE:
-        stop_motor()
-        if not fired:
-            print(f"[AIM] Centered (error: {error}px) — firing")
-            time.sleep(0.2)
-            fire()
-            fired = True
-    elif error < 0:
-        rotate_left(error)
-    else:
-        rotate_right(error)
-
-# ─────────────────────────────────────────────
-# PICO ON/OFF CONTROL (stdin → serial)
-# ─────────────────────────────────────────────
-# Background thread reads the terminal for 'on' or 'off' and forwards the
-# command to the Pico over serial.  Non-blocking relative to the camera loop.
-
 def _pico_control_thread():
-    """Read stdin for 'on'/'off' and send to Pico.  Runs as a daemon thread."""
-    print("[CONTROL] Type 'on' or 'off' to start/stop the Pico. (default: off)")
+    print("[CONTROL] Type Pico commands (h, on, off, +5, -10, home, …)")
     while True:
         try:
             cmd = input().strip().lower()
         except EOFError:
             break
-        if cmd in ("on", "off"):
-            print(f"[CONTROL] Sending '{cmd}' to Pico")
-            send_command(cmd)
-        else:
-            print(f"[CONTROL] Unknown: '{cmd}' — use 'on' or 'off'")
+        if not cmd:
+            continue
+        print(f"[CONTROL] Sending '{cmd}' to Pico")
+        send_command(cmd)
 
 threading.Thread(target=_pico_control_thread, daemon=True).start()
 
-# ─────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────
+print(
+    "[CAMERA] Stream running; posture pauses during Pico homing until [HOMING] enabled. Ctrl+C to quit.\n"
+)
 
-print("[CAMERA] Starting posture detection... Press Ctrl+C to quit.\n")
-
-# Shared state between capture loop (main thread) and pose worker thread.
-# Main thread is fast (capture + draw + stream push). Worker thread runs
-# MediaPipe on whatever raw frame is latest — stream no longer waits on it.
 pose_lock = threading.Lock()
-pose_raw_frame = None          # latest BGR frame awaiting inference
-pose_raw_id = 0                # monotonic id so worker skips stale frames
+pose_raw_frame = None
+pose_raw_id = 0
 pose_state = {
     "cached_landmarks": None,
     "stable_slouching": False,
     "bad_since": None,
     "last_reasons": set(),
     "person_lost_streak": 0,
-    "aiming_mode": False,
+    "steady_bad_announced": False,
     "_last_id": 0,
+    "ultrasonic_banner": None,
 }
 pose_stop = threading.Event()
+camera_shutdown = threading.Event()
 
 
 def pose_worker():
-    global fired
     while not pose_stop.is_set():
+        if not posture_tracking_enabled.is_set():
+            time.sleep(0.05)
+            continue
         with pose_lock:
             if pose_raw_frame is None or pose_raw_id == pose_state["_last_id"]:
                 frame = None
@@ -993,23 +822,11 @@ def pose_worker():
             time.sleep(0.01)
             continue
 
-        # Downscale for MediaPipe only — the model's input is ~256 sq anyway,
-        # so smaller input just cuts the preprocess cost. Landmarks are
-        # normalized (0-1), so they map back to any frame size for drawing.
         h, w = frame.shape[:2]
         small = cv2.resize(frame, (128, int(128 * h / w))) if w > 128 else frame
         rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        t0 = time.time()
         results = pose.process(rgb_frame)
         now = time.time()
-
-        # Update shared state under pose_lock, but never call serial (handle_aiming /
-        # stop_motor) while holding it — send_command can block, which would freeze
-        # the main camera loop that also needs pose_lock.
-        aim_w = w
-        lm_aim = None
-        do_aim = False
-        do_stop_motor = False
 
         with pose_lock:
             if results.pose_landmarks:
@@ -1033,18 +850,11 @@ def pose_worker():
                     pose_state["last_reasons"] = set()
 
                 if pose_state["stable_slouching"]:
-                    if not pose_state["aiming_mode"]:
+                    if not pose_state["steady_bad_announced"]:
                         print("[POSTURE] BAD")
-                        print("[AIM] Aiming...")
-                        pose_state["aiming_mode"] = True
-                        fired = False
-                    lm_aim = lm
-                    do_aim = True
+                        pose_state["steady_bad_announced"] = True
                 else:
-                    if pose_state["aiming_mode"]:
-                        pose_state["aiming_mode"] = False
-                        fired = False
-                        do_stop_motor = True
+                    pose_state["steady_bad_announced"] = False
             else:
                 pose_state["person_lost_streak"] += 1
                 if pose_state["person_lost_streak"] >= PERSON_LOST_STREAK:
@@ -1052,34 +862,32 @@ def pose_worker():
                     pose_state["stable_slouching"] = False
                     pose_state["bad_since"] = None
                     pose_state["last_reasons"] = set()
-                    if pose_state["aiming_mode"]:
+                    if pose_state["steady_bad_announced"]:
                         print("[POSTURE] GOOD")
-                        pose_state["aiming_mode"] = False
-                        fired = False
-                        do_stop_motor = True
+                    pose_state["steady_bad_announced"] = False
 
-        if do_stop_motor:
-            stop_motor()
-        if do_aim and lm_aim is not None:
-            handle_aiming(lm_aim, aim_w)
+        if posture_tracking_enabled.is_set():
+            if results.pose_landmarks:
+                _lm = results.pose_landmarks.landmark
+                _mid_x = (_lm[plm.LEFT_SHOULDER].x + _lm[plm.RIGHT_SHOULDER].x) * 0.5
+                _error_px = int((_mid_x - 0.5) * FRAME_WIDTH)
+                send_command(f"P,{_error_px}")
+            else:
+                send_command("stop")
 
-        # Idle gap between inferences. Raising this lowers the inference
-        # core's duty cycle (cools the Pi) at the cost of landmark Hz.
-        # 90 ms + ~285 ms/inference ≈ 76% duty on the hot core.
         time.sleep(0.09)
-
 
 threading.Thread(target=pose_worker, daemon=True).start()
 
 
-try:
-    while True:
+def _camera_capture_loop():
+    global latest_frame, pose_raw_frame, pose_raw_id
+    while not camera_shutdown.is_set():
         ret, frame = cap.read()
         if not ret:
             print("[CAMERA] Read failed")
             break
 
-        # Match requested size so MediaPipe norms line up with drawing (drivers often ignore WxH).
         if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
             frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
@@ -1090,10 +898,27 @@ try:
             stable_slouching = pose_state["stable_slouching"]
             bad_since = pose_state["bad_since"]
             last_reasons = pose_state["last_reasons"]
+            ultra_banner = (
+                pose_state["ultrasonic_banner"]
+                if amUsingUltrasonicSensor
+                else None
+            )
 
         display_frame = frame.copy()
+        tracking = posture_tracking_enabled.is_set()
 
-        if cached_landmarks is not None:
+        if not tracking:
+            cv2.putText(
+                display_frame,
+                "HOMING IN PROGRESS",
+                (8, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.64,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        elif cached_landmarks is not None:
             overlay_reasons = last_reasons if stable_slouching else set()
             draw_posture_overlay(display_frame, cached_landmarks, stable_slouching, overlay_reasons)
 
@@ -1128,12 +953,50 @@ try:
                 2,
             )
 
+        if ultra_banner:
+            cv2.putText(
+                display_frame,
+                ultra_banner,
+                (10, 58),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (0, 140, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
         latest_frame = display_frame
 
+
+cam_thread = threading.Thread(target=_camera_capture_loop, daemon=True)
+cam_thread.start()
+time.sleep(0.3)
+
+if ser:
+    threading.Thread(target=_serial_reader_thread, daemon=True).start()
+    send_command("on")
+    time.sleep(0.15)
+    send_command("stop")
+    time.sleep(0.05)
+    send_command("h")
+    print("[CONTROL] Sent on, stop, h — finish homing in this terminal.")
+
+try:
+    while True:
+        time.sleep(0.25)
 except KeyboardInterrupt:
     print("\n[INFO] Stopped.")
 finally:
     pose_stop.set()
+    camera_shutdown.set()
+    if ser:
+        try:
+            send_command("stop")
+            time.sleep(0.05)
+            send_command("off")
+        except Exception:
+            pass
+    cam_thread.join(timeout=3.0)
     try:
         cap.release()
     except Exception:

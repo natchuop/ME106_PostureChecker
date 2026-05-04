@@ -1,157 +1,160 @@
-"""
-postureCheckWithMotors.py — Runs on Raspberry Pi Pico (MicroPython)
-
-Receives \n-delimited commands from the host (Raspberry Pi or Windows laptop)
-over USB serial:
-
-    on          — enable the active loop
-    off         — disable the active loop
-    move:<int>  — rotate the platform (positive = right, negative = left)
-    fire        — trigger the flywheel/servo sequence
-
-Loop structure:
-    outer loop  — idle; waits for 'on'
-    inner loop  — active; checks ultrasonic gate, then drives motors
-        ultrasonic gate: if something is within 0.5 ft, pause and wait for
-        clearance (or 'off') before proceeding with motor commands.
-"""
+"""Pico firmware: serial on/off/h/fire/stop/ultrasonic/P,<px>. Flywheel gated by distance when amUsingUltrasonicSensor (see ULTRASONIC_MAX_RANGE_FT, -1 = no echo)."""
 
 import sys
 import uselect as select
 import time
 import MotorControlFunctions as mcf
 
-# ── Non-blocking serial reader ────────────────────────────────────────────────
-# Reads one character at a time from USB-CDC stdin using select so the main
-# loop is never blocked waiting for host data.
+amUsingUltrasonicSensor = True
+ULTRASONIC_MAX_RANGE_FT = 4.0
 
 _poll = select.poll()
 _poll.register(sys.stdin, select.POLLIN)
 
 
+def _blocking_home_sequence():
+    try:
+        _poll.unregister(sys.stdin)
+    except OSError:
+        pass
+    try:
+        mcf.homePlatformMotor()
+    finally:
+        try:
+            _poll.register(sys.stdin, select.POLLIN)
+        except OSError:
+            pass
+
+
 def _read_command():
-    """
-    Return the next complete \\n-terminated command string, or None if no full
-    line is available yet.
-    """
-    if _poll.poll(0):            # 0 ms timeout → non-blocking
+    if _poll.poll(0):
         line = sys.stdin.readline()
         if line:
-            stripped = line.strip()
-            return stripped if stripped else None
+            s = line.strip()
+            return s if s else None
     return None
 
 
-# ── Initialisation ────────────────────────────────────────────────────────────
+def _parse_p(cmd):
+    if cmd and cmd.lower().startswith("p,"):
+        try:
+            return int(cmd.split(",", 1)[1])
+        except (ValueError, IndexError):
+            pass
+    return None
+
+
+def _print_ultrasonic():
+    if not amUsingUltrasonicSensor:
+        print("Ultrasonic disabled (amUsingUltrasonicSensor=False).")
+        return
+    d = mcf.readUltrasonic()
+    print("U: -1 (timeout/no echo)" if d == -1 else "U: " + str(round(d, 3)) + " ft")
+
 
 def _initialize():
-    mcf.initializeUltrasonic()
+    if amUsingUltrasonicSensor:
+        mcf.initializeUltrasonic()
     mcf.initializeFlywheel()
     mcf.initializeCrankServo()
     mcf.initializePlatformMotor()
-    print("Pico ready. Waiting for 'on'...")
+    print("Pico ready. Send 'on' then 'h' to home the platform.")
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     _initialize()
+    active = False
+    fire_pending = False
+    us_prev_in_range = None
 
-    active       = False   # True while host has sent 'on'
-    fire_pending = False   # True when a 'fire' command is queued
-    latest_move  = 0       # most recent move:<int> value from host
-    proximity_blocked = False
-    block_threshold_ft = 0.5
-    clear_threshold_ft = 0.6  # hysteresis: require more clearance to exit blocked
+    def announce_range(in_range):
+        nonlocal us_prev_in_range
+        if us_prev_in_range is not None and in_range == us_prev_in_range:
+            return
+        us_prev_in_range = in_range
+        if in_range:
+            print("TARGET IN RANGE")
+            print("USONIC_WEB:in_range")
+        else:
+            print("TARGET OUT OF RANGE")
+            print("USONIC_WEB:out_of_range")
 
     while True:
-        # ── Outer loop: idle, waiting for 'on' ───────────────────────────────
         cmd = _read_command()
         if cmd == "on":
             active = True
             fire_pending = False
-            latest_move  = 0
-            proximity_blocked = False
+            us_prev_in_range = None
             print("Active.")
+        elif cmd == "h":
+            print("Entering HOME MODE (jog +/- degrees, then type 'home').")
+            _blocking_home_sequence()
+            print("HOME complete.")
         elif cmd == "ultrasonic":
-            dist = mcf.readUltrasonic()
-            if dist == -1:
-                print("U: -1 (timeout/no echo)")
-            else:
-                print("U:", round(dist, 3), "ft")
+            _print_ultrasonic()
+        else:
+            err = _parse_p(cmd)
+            if err is not None:
+                mcf.rotatePlatformMotor(err)
 
         if not active:
             time.sleep_ms(20)
             continue
 
-        # ── Inner loop: active ────────────────────────────────────────────────
         while active:
-            # Always drain serial first so 'off' is never missed
-            cmd = _read_command()
-            if cmd == "off":
-                active = False
-                proximity_blocked = False
-                mcf.rotatePlatform(0)
-                print("Inactive.")
-                break
-            elif cmd == "stop":
-                latest_move = 0
-            elif cmd is not None and cmd.startswith("move:"):
-                try:
-                    latest_move = int(cmd[5:])
-                except ValueError:
-                    pass
-            elif cmd == "fire":
-                fire_pending = True
-                print("Fire command received.")
-            elif cmd == "ultrasonic":
-                dist = mcf.readUltrasonic()
-                if dist == -1:
-                    print("U: -1 (timeout/no echo)")
+            breaker = False
+            while True:
+                cmd = _read_command()
+                if cmd is None:
+                    break
+                if cmd == "off":
+                    breaker = True
+                    active = False
+                    mcf.stopPlatformMotor()
+                    print("Inactive.")
+                    break
+                if cmd == "stop":
+                    mcf.stopPlatformMotor()
+                elif cmd == "h":
+                    print("Entering HOME MODE (jog +/- degrees, then type 'home').")
+                    mcf.stopPlatformMotor()
+                    _blocking_home_sequence()
+                    print("HOME complete. Staying active.")
+                elif cmd == "fire":
+                    fire_pending = True
+                    print("Fire command received.")
+                elif cmd == "ultrasonic":
+                    _print_ultrasonic()
                 else:
-                    print("U:", round(dist, 3), "ft")
+                    err = _parse_p(cmd)
+                    if err is not None:
+                        mcf.rotatePlatformMotor(err)
 
-            # ── Ultrasonic proximity gate ─────────────────────────────────────
-            dist = mcf.readUltrasonic()
-            if dist == -1:
-                # Keep previous blocked state on sensor timeout to avoid flicker.
-                too_close = proximity_blocked
-            elif proximity_blocked:
-                too_close = (dist < clear_threshold_ft)
+            if breaker:
+                break
+
+            if amUsingUltrasonicSensor:
+                d = mcf.readUltrasonic()
+                in_range = d != -1 and d <= ULTRASONIC_MAX_RANGE_FT
+                announce_range(in_range)
+                blocked = not in_range
             else:
-                too_close = (dist < block_threshold_ft)
+                blocked = False
 
-            if too_close:
-                if not proximity_blocked:
-                    print("BLOCKED — object too close, pausing.")
-                    proximity_blocked = True
-                # While blocked: keep motors stopped, then re-check next loop pass.
-                mcf.rotatePlatform(0)
+            if blocked:
                 if mcf.flywheel_active:
                     mcf.stopFlywheel()
                 time.sleep_ms(50)
                 continue
-            elif proximity_blocked:
-                proximity_blocked = False
-                print("CLEAR — resuming.")
 
-            # ── Actual motor code (ultrasonic clear) ──────────────────────────
-
-            # Rotate platform toward the target
-            mcf.rotatePlatform(latest_move)
-
-            # Advance flywheel state machine (non-blocking every loop pass)
             if mcf.flywheel_active:
                 mcf.tryFlywheel()
             elif fire_pending:
                 fire_pending = False
                 print("Flywheel starting.")
-                mcf.tryFlywheel()   # starts a new cycle
+                mcf.tryFlywheel()
 
-            # ── Add your additional code below this line ──────────────────────
-            # (user will fill this section in the next step)
-
-            time.sleep_ms(20)   # ~50 Hz loop rate
+            time.sleep_ms(20)
 
 
 try:
