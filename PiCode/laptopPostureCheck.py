@@ -62,9 +62,10 @@ HIP_MIN_VISIBILITY = 0.35
 NOSE_MIN_VISIBILITY = 0.2
 EAR_MIN_VISIBILITY = 0.22
 FOREHEAD_VIS_MIN = 0.18
+CAMERA_FPS = 8
 
-AIM_DEADBAND_PX = 12
-AIM_CENTER_HOLD_SECONDS = 1.0
+AIM_DEADBAND_PX = 15
+AIM_CENTER_HOLD_SECONDS = 0.01
 FLYWHEEL_CYCLE_TIME_MS = 10000
 
 ser = None
@@ -201,12 +202,13 @@ class PiCamMJPEG:
     def read(self):
         with self._cond:
             if not self._cond.wait_for(
-                lambda: self._frame_id > self._last_seen_id or self._latest is not None,
-                timeout=2.0,
+                lambda: self._frame_id > self._last_seen_id,
+                timeout=1.0,
             ):
                 return False, None
+
             self._last_seen_id = self._frame_id
-            return (self._latest is not None), self._latest
+            return True, self._latest
 
     def release(self):
         self._opened = False
@@ -255,7 +257,7 @@ def open_camera():
     if IS_LINUX and _has_csi_camera():
         try:
             print("[CAMERA] CSI Pi Camera detected — using rpicam-vid (MJPEG)")
-            pi = PiCamMJPEG(FRAME_WIDTH, FRAME_HEIGHT, fps=5)
+            pi = PiCamMJPEG(FRAME_WIDTH, FRAME_HEIGHT, fps=CAMERA_FPS)
             warmup_deadline = time.time() + 15.0
             best = 0.0
             last_frame = None
@@ -929,7 +931,7 @@ def pose_worker():
 
         with pose_lock:
             in_cooldown = time.time() < pose_state["fire_cooldown_until"]
-        time.sleep(0.3 if in_cooldown else 0.15)
+        time.sleep(0.5 if in_cooldown else 0.05)
 
 threading.Thread(target=pose_worker, daemon=True).start()
 
@@ -1036,7 +1038,7 @@ def _camera_capture_loop():
         latest_frame = display_frame
         with pose_lock:
             in_cooldown = time.time() < pose_state["fire_cooldown_until"]
-        time.sleep(0.5 if in_cooldown else 0.1)
+        time.sleep(0.05 if in_cooldown else 0.01)
 
 
 cam_thread = threading.Thread(target=_camera_capture_loop, daemon=True)
