@@ -64,6 +64,7 @@ EAR_MIN_VISIBILITY = 0.22
 FOREHEAD_VIS_MIN = 0.18
 
 AIM_DEADBAND_PX = 7
+AIM_CENTER_HOLD_SECONDS = 1.0
 FLYWHEEL_CYCLE_TIME_MS = 10000
 
 ser = None
@@ -523,6 +524,9 @@ def _serial_reader_thread():
                             pose_state["bad_since"] = None
                             pose_state["last_reasons"] = set()
                             pose_state["person_lost_streak"] = 0
+                            pose_state["fire_cooldown_until"] = 0.0
+                            pose_state["aim_center_since"] = None
+                            pose_state["aim_fired_for_current_bad"] = False
                     elif amUsingUltrasonicSensor and text == "USONIC_WEB:out_of_range":
                         with pose_lock:
                             pose_state["ultrasonic_banner"] = "TARGET OUT OF RANGE"
@@ -791,6 +795,8 @@ pose_state = {
     "_last_id": 0,
     "ultrasonic_banner": None,
     "fire_cooldown_until": 0.0,
+    "aim_center_since": None,
+    "aim_fired_for_current_bad": False,
 }
 pose_stop = threading.Event()
 camera_shutdown = threading.Event()
@@ -843,6 +849,10 @@ def pose_worker():
                     pose_state["stable_slouching"] = False
                     pose_state["last_reasons"] = set()
                     pose_state["fire_cooldown_until"] = 0.0
+                    pose_state["aim_center_since"] = None
+                    pose_state["aim_fired_for_current_bad"] = False
+                    pose_state["aim_center_since"] = None
+                    pose_state["aim_fired_for_current_bad"] = False
 
                 if pose_state["stable_slouching"]:
                     if not pose_state["steady_bad_announced"]:
@@ -879,20 +889,37 @@ def pose_worker():
                     pass
                 else:
                     # Send fixed-speed commands: P -20 or P 20
-                    if _error_px < 0:
-                        send_command("P,+20")
-                    elif _error_px > 0:
-                        send_command("P,-20")
-                    else:
+                    centered = abs(_error_px) <= AIM_DEADBAND_PX
+
+                    if centered:
                         send_command("stop")
-                    
-                    # Fire when centered (within deadband) and cooldown expired
-                    if abs(_error_px) <= AIM_DEADBAND_PX:
-                        send_command("fire")
+
                         with pose_lock:
-                            pose_state["fire_cooldown_until"] = now + (FLYWHEEL_CYCLE_TIME_MS / 1000.0)
-                        print("[FIRING] Centered and firing!")
-                        time.sleep(0.5)
+                            if pose_state["aim_center_since"] is None:
+                                pose_state["aim_center_since"] = now
+
+                            centered_hold = now - pose_state["aim_center_since"]
+                            already_fired = pose_state["aim_fired_for_current_bad"]
+
+                        if centered_hold >= AIM_CENTER_HOLD_SECONDS and not already_fired:
+                            send_command("fire")
+                            with pose_lock:
+                                pose_state["fire_cooldown_until"] = now + (FLYWHEEL_CYCLE_TIME_MS / 1000.0)
+                                pose_state["aim_fired_for_current_bad"] = True
+                                pose_state["aim_center_since"] = None
+
+                            print("[FIRING] Bad posture centered — firing!")
+                            time.sleep(0.5)
+
+                    else:
+                        with pose_lock:
+                            pose_state["aim_center_since"] = None
+
+                        # Inverted because platform direction is reversed
+                        if _error_px < 0:
+                            send_command("P,20")
+                        elif _error_px > 0:
+                            send_command("P,-20")
             else:
                 if not results.pose_landmarks:
                     send_command("stop")
